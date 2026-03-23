@@ -16,6 +16,7 @@ Environment:
 
 --*/
 #include "vhidmini.h"
+#include "goodix_9916r_blobs.h"
 
 #define DEBUG
 
@@ -38,6 +39,28 @@ Environment:
 #define BYTES_PER_COORD 0x8
 #define BYTES_CHKSUM 0x2
 #define MAX_POINT_NUM 0xA
+
+#define GOODIX_CFG_BIN_HEAD_LEN            16U
+#define GOODIX_CFG_BIN_VERSION_START       5U
+#define GOODIX_CFG_PACKAGE_SENSOR_ANY      0xFFU
+#define GOODIX_CFG_PACKAGE_CONST_INFO_LEN  56U
+#define GOODIX_CFG_PACKAGE_REG_INFO_LEN    65U
+#define GOODIX_CFG_PACKAGE_DATA_OFFSET     (GOODIX_CFG_PACKAGE_CONST_INFO_LEN + GOODIX_CFG_PACKAGE_REG_INFO_LEN)
+#define GOODIX_CFG_TYPE_NORMAL             0x01U
+#define GOODIX_CFG_CMD_LEN                 4U
+#define GOODIX_CFG_CMD_START               0x04U
+#define GOODIX_CFG_CMD_WRITE               0x05U
+#define GOODIX_CFG_CMD_EXIT                0x06U
+#define GOODIX_CFG_CMD_STATUS_PASS         0x80U
+#define GOODIX_CFG_CMD_WAIT_RETRY          20U
+#define GOODIX_CFG_TRANSFER_CHUNK          240U
+
+typedef struct _GOODIX_CFG_PACKAGE_INFO {
+    const UINT8* ConfigData;
+    ULONG ConfigLength;
+    UINT8 ConfigType;
+    UINT8 SensorId;
+} GOODIX_CFG_PACKAGE_INFO, *PGOODIX_CFG_PACKAGE_INFO;
 
 ULONG XRevert = 0;
 ULONG YRevert = 0;
@@ -78,6 +101,27 @@ GoodixAppendChecksumU8Le(
 }
 
 static
+UINT16
+GoodixReadU16Le(
+    _In_reads_bytes_(2) const UINT8* Data
+    )
+{
+    return (UINT16)Data[0] | ((UINT16)Data[1] << 8);
+}
+
+static
+UINT32
+GoodixReadU32Le(
+    _In_reads_bytes_(4) const UINT8* Data
+    )
+{
+    return (UINT32)Data[0] |
+        ((UINT32)Data[1] << 8) |
+        ((UINT32)Data[2] << 16) |
+        ((UINT32)Data[3] << 24);
+}
+
+static
 BOOLEAN
 GoodixChecksumValidU8Le(
     _In_reads_bytes_(Length) const UINT8* Data,
@@ -99,6 +143,31 @@ GoodixChecksumValidU8Le(
 }
 
 static
+BOOLEAN
+GoodixConfigBinValid(
+    _In_reads_bytes_(Length) const UINT8* Data,
+    _In_ ULONG Length
+    )
+{
+    ULONG checksum = 0;
+    ULONG i;
+
+    if (Length < GOODIX_CFG_BIN_HEAD_LEN) {
+        return FALSE;
+    }
+
+    if (GoodixReadU32Le(Data) != Length) {
+        return FALSE;
+    }
+
+    for (i = GOODIX_CFG_BIN_VERSION_START; i < Length; i++) {
+        checksum += Data[i];
+    }
+
+    return (((UINT8)checksum) == Data[4]);
+}
+
+static
 UINT8
 GoodixNormalizeReportRateLevel(
     _In_ UINT8 ReportRateLevel
@@ -114,6 +183,72 @@ GoodixNormalizeReportRateLevel(
     default:
         return GOODIX_REPORT_RATE_240HZ;
     }
+}
+
+static
+NTSTATUS
+GoodixWriteLarge(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _In_ UINT32 Address,
+    _In_reads_bytes_(Length) const UINT8* Buffer,
+    _In_ ULONG Length
+    )
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG offset = 0;
+
+    while (offset < Length) {
+        ULONG chunk = Length - offset;
+        if (chunk > GOODIX_CFG_TRANSFER_CHUNK) {
+            chunk = GOODIX_CFG_TRANSFER_CHUNK;
+        }
+
+        status = GoodixWrite(
+            DeviceContext,
+            Address + offset,
+            (UINT8*)(Buffer + offset),
+            chunk);
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+
+        offset += chunk;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static
+NTSTATUS
+GoodixReadLarge(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _In_ UINT32 Address,
+    _Out_writes_bytes_(Length) UINT8* Buffer,
+    _In_ ULONG Length
+    )
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG offset = 0;
+
+    while (offset < Length) {
+        ULONG chunk = Length - offset;
+        if (chunk > GOODIX_CFG_TRANSFER_CHUNK) {
+            chunk = GOODIX_CFG_TRANSFER_CHUNK;
+        }
+
+        status = GoodixRead(
+            DeviceContext,
+            Address + offset,
+            Buffer + offset,
+            chunk);
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+
+        offset += chunk;
+    }
+
+    return STATUS_SUCCESS;
 }
 
 static
@@ -171,6 +306,175 @@ GoodixSendCommand(
 Exit:
     WdfWaitLockRelease(DeviceContext->IoLock);
     return status;
+}
+
+static
+NTSTATUS
+GoodixWaitConfigStatus(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _In_ UINT8 TargetStatus,
+    _In_ ULONG RetryCount
+    )
+{
+    GOODIX_CMD_PACKET ack = { 0 };
+    NTSTATUS status = STATUS_IO_TIMEOUT;
+    ULONG retry;
+
+    for (retry = 0; retry < RetryCount; retry++) {
+        status = GoodixRead(
+            DeviceContext,
+            DeviceContext->CommandAddress,
+            ack.Buffer,
+            sizeof(ack));
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+
+        if (ack.State == TargetStatus) {
+            return STATUS_SUCCESS;
+        }
+
+        GoodixDelayMilliseconds(20);
+    }
+
+    return STATUS_IO_TIMEOUT;
+}
+
+static
+NTSTATUS
+GoodixSendConfigCommand(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _In_ UINT8 CommandCode
+    )
+{
+    GOODIX_CMD_PACKET cmd = { 0 };
+    NTSTATUS status;
+
+    cmd.Length = GOODIX_CFG_CMD_LEN;
+    cmd.Command = CommandCode;
+
+    status = GoodixSendCommand(DeviceContext, &cmd);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    return GoodixWaitConfigStatus(
+        DeviceContext,
+        GOODIX_CFG_CMD_STATUS_PASS,
+        GOODIX_CFG_CMD_WAIT_RETRY);
+}
+
+static
+NTSTATUS
+GoodixFindConfigPackage(
+    _In_ UINT8 SensorId,
+    _Out_ PGOODIX_CFG_PACKAGE_INFO Package
+    )
+{
+    ULONG pkgNum;
+    ULONG pkgIndex;
+    ULONG firstWildcardOffset = 0;
+    ULONG selectedOffset = 0;
+    ULONG binLength = g_GoodixCfgGroup9916rBinLen;
+    const UINT8* binData = g_GoodixCfgGroup9916rBin;
+
+    RtlZeroMemory(Package, sizeof(*Package));
+
+    if (!GoodixConfigBinValid(binData, binLength)) {
+        return STATUS_CRC_ERROR;
+    }
+
+    pkgNum = binData[9];
+    if (pkgNum == 0) {
+        return STATUS_NOT_FOUND;
+    }
+
+    for (pkgIndex = 0; pkgIndex < pkgNum; pkgIndex++) {
+        ULONG offsetTable = GOODIX_CFG_BIN_HEAD_LEN + (pkgIndex * 2U);
+        ULONG pkgOffset;
+        ULONG nextOffset;
+        ULONG pkgLength;
+        UINT8 packageSensorId;
+
+        if ((offsetTable + 1U) >= binLength) {
+            return STATUS_INVALID_BUFFER_SIZE;
+        }
+
+        pkgOffset = GoodixReadU16Le(binData + offsetTable);
+        if (pkgOffset >= binLength || (pkgOffset + GOODIX_CFG_PACKAGE_DATA_OFFSET) > binLength) {
+            return STATUS_INVALID_BUFFER_SIZE;
+        }
+
+        if (pkgIndex + 1U == pkgNum) {
+            nextOffset = binLength;
+        } else {
+            ULONG nextTable = GOODIX_CFG_BIN_HEAD_LEN + ((pkgIndex + 1U) * 2U);
+            if ((nextTable + 1U) >= binLength) {
+                return STATUS_INVALID_BUFFER_SIZE;
+            }
+            nextOffset = GoodixReadU16Le(binData + nextTable);
+        }
+
+        if (nextOffset <= pkgOffset || nextOffset > binLength) {
+            return STATUS_INVALID_BUFFER_SIZE;
+        }
+
+        pkgLength = nextOffset - pkgOffset;
+        packageSensorId = binData[pkgOffset + 20U];
+
+        if (packageSensorId == SensorId) {
+            selectedOffset = pkgOffset;
+            break;
+        }
+
+        if (packageSensorId == GOODIX_CFG_PACKAGE_SENSOR_ANY && firstWildcardOffset == 0) {
+            firstWildcardOffset = pkgOffset;
+        }
+    }
+
+    if (selectedOffset == 0) {
+        selectedOffset = firstWildcardOffset;
+    }
+
+    if (selectedOffset == 0) {
+        return STATUS_NOT_FOUND;
+    }
+
+    {
+        ULONG pkgIndexLocal;
+        ULONG nextOffset;
+        ULONG pkgLength;
+        UINT8 cfgType;
+
+        pkgIndexLocal = 0;
+        while (pkgIndexLocal < pkgNum) {
+            ULONG offsetTable = GOODIX_CFG_BIN_HEAD_LEN + (pkgIndexLocal * 2U);
+            ULONG pkgOffset = GoodixReadU16Le(binData + offsetTable);
+            if (pkgOffset == selectedOffset) {
+                break;
+            }
+            pkgIndexLocal++;
+        }
+
+        if (pkgIndexLocal + 1U == pkgNum) {
+            nextOffset = binLength;
+        } else {
+            nextOffset = GoodixReadU16Le(binData + GOODIX_CFG_BIN_HEAD_LEN + ((pkgIndexLocal + 1U) * 2U));
+        }
+
+        pkgLength = nextOffset - selectedOffset;
+        cfgType = binData[selectedOffset + 19U];
+        if (pkgLength <= GOODIX_CFG_PACKAGE_DATA_OFFSET) {
+            return STATUS_INVALID_BUFFER_SIZE;
+        }
+
+        Package->SensorId = binData[selectedOffset + 20U];
+        Package->ConfigType = cfgType;
+        Package->ConfigData = binData + selectedOffset + GOODIX_CFG_PACKAGE_DATA_OFFSET;
+        Package->ConfigLength = pkgLength - GOODIX_CFG_PACKAGE_DATA_OFFSET;
+    }
+
+    return STATUS_SUCCESS;
 }
 
 
@@ -691,6 +995,10 @@ Return Value:
     deviceContext->VersionValid = FALSE;
     deviceContext->TouchDataAddress = TOUCH_INFO_ADDR;
     deviceContext->CommandAddress = CMD_ADDR;
+    deviceContext->FwBufferAddress = 0;
+    deviceContext->FwBufferMaxLength = 0;
+    deviceContext->IcInfoValid = FALSE;
+    deviceContext->ConfigApplied = FALSE;
 
     status = WdfWaitLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &deviceContext->IoLock);
     if (!NT_SUCCESS(status)) {
@@ -1019,6 +1327,10 @@ OnD0Entry(
         return status;
     }
 
+    if (pDevice->Interrupt != NULL) {
+        WdfInterruptDisable(pDevice->Interrupt);
+    }
+
     status = GoodixReadVersion(pDevice, &version);
     if (NT_SUCCESS(status)) {
         pDevice->SensorId = version.SensorId;
@@ -1028,11 +1340,33 @@ OnD0Entry(
             version.SensorId,
             version.PatchPid[0], version.PatchPid[1], version.PatchPid[2], version.PatchPid[3],
             version.PatchPid[4], version.PatchPid[5], version.PatchPid[6], version.PatchPid[7]);
+        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "Embedded fw pid=%c%c%c%c%c vid=%02X%02X%02X%02X current_vid=%02X%02X%02X%02X",
+            g_GoodixEmbeddedFwPid[0], g_GoodixEmbeddedFwPid[1], g_GoodixEmbeddedFwPid[2],
+            g_GoodixEmbeddedFwPid[3], g_GoodixEmbeddedFwPid[4],
+            g_GoodixEmbeddedFwVid[0], g_GoodixEmbeddedFwVid[1], g_GoodixEmbeddedFwVid[2], g_GoodixEmbeddedFwVid[3],
+            version.PatchVid[0], version.PatchVid[1], version.PatchVid[2], version.PatchVid[3]);
 #endif
     } else {
 #ifdef DEBUG
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "GoodixReadVersion failed status=0x%08X", status);
 #endif
+    }
+
+    status = GoodixReadIcInfo(pDevice);
+    if (!NT_SUCCESS(status)) {
+#ifdef DEBUG
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "GoodixReadIcInfo failed status=0x%08X, keeping defaults", status);
+#endif
+        status = STATUS_SUCCESS;
+    }
+
+    status = GoodixApplyEmbeddedConfig(pDevice);
+    if (!NT_SUCCESS(status)) {
+#ifdef DEBUG
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "GoodixApplyEmbeddedConfig failed sensor_id=%u status=0x%08X",
+            pDevice->SensorId, status);
+#endif
+        status = STATUS_SUCCESS;
     }
 
     status = GoodixApplyReportRate(pDevice, pDevice->ReportRateLevel);
@@ -1042,6 +1376,10 @@ OnD0Entry(
             pDevice->ReportRateLevel, status);
 #endif
         status = STATUS_SUCCESS;
+    }
+
+    if (pDevice->Interrupt != NULL) {
+        WdfInterruptEnable(pDevice->Interrupt);
     }
 
     return status;
@@ -2570,6 +2908,246 @@ GoodixReadVersion(
     }
 
     return NT_SUCCESS(status) ? STATUS_CRC_ERROR : status;
+}
+
+NTSTATUS
+GoodixReadIcInfo(
+    _In_ PDEVICE_CONTEXT pDevice
+    )
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    UINT8* icInfoBuf;
+    UINT8 retry;
+    USHORT icInfoLength = 0;
+
+    icInfoBuf = (UINT8*)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        GOODIX_IC_INFO_MAX_LEN,
+        TOUCH_POOL_TAG);
+    if (icInfoBuf == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    for (retry = 0; retry < 3; retry++) {
+        status = GoodixRead(pDevice, GOODIX_IC_INFO_ADDR, (UINT8*)&icInfoLength, sizeof(icInfoLength));
+        if (!NT_SUCCESS(status)) {
+            GoodixDelayMilliseconds(5);
+            continue;
+        }
+
+        icInfoLength = GoodixReadU16Le((const UINT8*)&icInfoLength);
+        if (icInfoLength < 2 || icInfoLength > GOODIX_IC_INFO_MAX_LEN) {
+            status = STATUS_INFO_LENGTH_MISMATCH;
+            GoodixDelayMilliseconds(5);
+            continue;
+        }
+
+        status = GoodixRead(pDevice, GOODIX_IC_INFO_ADDR, icInfoBuf, icInfoLength);
+        if (!NT_SUCCESS(status)) {
+            GoodixDelayMilliseconds(5);
+            continue;
+        }
+
+        if (!GoodixChecksumValidU8Le(icInfoBuf, icInfoLength)) {
+            status = STATUS_CRC_ERROR;
+            GoodixDelayMilliseconds(5);
+            continue;
+        }
+
+        {
+            const UINT8* cur = icInfoBuf + 2;
+            ULONG remaining = icInfoLength - 2;
+            UINT8 activeScanRateNum;
+            UINT8 mutualFreqNum;
+            UINT8 selfTxFreqNum;
+            UINT8 selfRxFreqNum;
+            UINT8 stylusFreqNum;
+            GOODIX_IC_INFO_MISC misc = { 0 };
+
+            if (remaining < 15U + 10U + 5U) {
+                status = STATUS_INVALID_BUFFER_SIZE;
+                break;
+            }
+
+            cur += 15U;
+            remaining -= 15U;
+            cur += 10U;
+            remaining -= 10U;
+
+            activeScanRateNum = cur[4];
+            cur += 5U;
+            remaining -= 5U;
+            if (activeScanRateNum > 8U || remaining < (ULONG)activeScanRateNum * 2U + 1U) {
+                status = STATUS_INVALID_BUFFER_SIZE;
+                break;
+            }
+            cur += (ULONG)activeScanRateNum * 2U;
+            remaining -= (ULONG)activeScanRateNum * 2U;
+
+            mutualFreqNum = *(cur++);
+            remaining -= 1U;
+            if (mutualFreqNum > 20U || remaining < (ULONG)mutualFreqNum * 2U + 1U) {
+                status = STATUS_INVALID_BUFFER_SIZE;
+                break;
+            }
+            cur += (ULONG)mutualFreqNum * 2U;
+            remaining -= (ULONG)mutualFreqNum * 2U;
+
+            selfTxFreqNum = *(cur++);
+            remaining -= 1U;
+            if (selfTxFreqNum > 20U || remaining < (ULONG)selfTxFreqNum * 2U + 1U) {
+                status = STATUS_INVALID_BUFFER_SIZE;
+                break;
+            }
+            cur += (ULONG)selfTxFreqNum * 2U;
+            remaining -= (ULONG)selfTxFreqNum * 2U;
+
+            selfRxFreqNum = *(cur++);
+            remaining -= 1U;
+            if (selfRxFreqNum > 20U || remaining < (ULONG)selfRxFreqNum * 2U + 1U) {
+                status = STATUS_INVALID_BUFFER_SIZE;
+                break;
+            }
+            cur += (ULONG)selfRxFreqNum * 2U;
+            remaining -= (ULONG)selfRxFreqNum * 2U;
+
+            stylusFreqNum = *(cur++);
+            remaining -= 1U;
+            if (stylusFreqNum > 8U || remaining < (ULONG)stylusFreqNum * 2U + sizeof(misc)) {
+                status = STATUS_INVALID_BUFFER_SIZE;
+                break;
+            }
+            cur += (ULONG)stylusFreqNum * 2U;
+            remaining -= (ULONG)stylusFreqNum * 2U;
+
+            RtlCopyMemory(&misc, cur, sizeof(misc));
+            misc.CmdAddress = GoodixReadU32Le((const UINT8*)&misc.CmdAddress);
+            misc.CmdMaxLength = GoodixReadU16Le((const UINT8*)&misc.CmdMaxLength);
+            misc.FwBufferAddress = GoodixReadU32Le((const UINT8*)&misc.FwBufferAddress);
+            misc.FwBufferMaxLength = GoodixReadU16Le((const UINT8*)&misc.FwBufferMaxLength);
+            misc.TouchDataAddress = GoodixReadU32Le((const UINT8*)&misc.TouchDataAddress);
+
+            if (misc.CmdAddress == 0 || misc.TouchDataAddress == 0 || misc.FwBufferAddress == 0) {
+                status = STATUS_INVALID_DEVICE_STATE;
+                break;
+            }
+
+            pDevice->CommandAddress = misc.CmdAddress;
+            pDevice->TouchDataAddress = misc.TouchDataAddress;
+            pDevice->FwBufferAddress = misc.FwBufferAddress;
+            pDevice->FwBufferMaxLength = misc.FwBufferMaxLength;
+            pDevice->IcInfoValid = TRUE;
+
+#ifdef DEBUG
+            TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
+                "Goodix ic_info ok cmd=0x%08X touch=0x%08X fwbuf=0x%08X fwbuflen=%u",
+                pDevice->CommandAddress,
+                pDevice->TouchDataAddress,
+                pDevice->FwBufferAddress,
+                pDevice->FwBufferMaxLength);
+#endif
+            status = STATUS_SUCCESS;
+            break;
+        }
+    }
+
+    ExFreePoolWithTag(icInfoBuf, TOUCH_POOL_TAG);
+    return status;
+}
+
+NTSTATUS
+GoodixApplyEmbeddedConfig(
+    _In_ PDEVICE_CONTEXT pDevice
+    )
+{
+    GOODIX_CFG_PACKAGE_INFO packageInfo;
+    NTSTATUS status;
+    UINT8* verifyBuffer;
+
+    if (pDevice->ConfigApplied) {
+        return STATUS_SUCCESS;
+    }
+
+    if (!pDevice->IcInfoValid || pDevice->FwBufferAddress == 0 || pDevice->FwBufferMaxLength == 0) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    status = GoodixFindConfigPackage(pDevice->SensorId, &packageInfo);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    if (packageInfo.ConfigType != GOODIX_CFG_TYPE_NORMAL) {
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    if (packageInfo.ConfigLength > pDevice->FwBufferMaxLength) {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    verifyBuffer = (UINT8*)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        packageInfo.ConfigLength,
+        TOUCH_POOL_TAG);
+    if (verifyBuffer == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+#ifdef DEBUG
+    TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
+        "Applying embedded cfg sensor_id=%u selected_sensor_id=%u len=%u fw_pid=%c%c%c%c%c",
+        pDevice->SensorId,
+        packageInfo.SensorId,
+        packageInfo.ConfigLength,
+        g_GoodixEmbeddedFwPid[0], g_GoodixEmbeddedFwPid[1], g_GoodixEmbeddedFwPid[2],
+        g_GoodixEmbeddedFwPid[3], g_GoodixEmbeddedFwPid[4]);
+#endif
+
+    status = GoodixSendConfigCommand(pDevice, GOODIX_CFG_CMD_START);
+    if (!NT_SUCCESS(status)) {
+        goto Exit;
+    }
+
+    status = GoodixWriteLarge(
+        pDevice,
+        pDevice->FwBufferAddress,
+        packageInfo.ConfigData,
+        packageInfo.ConfigLength);
+    if (!NT_SUCCESS(status)) {
+        goto SendExit;
+    }
+
+    status = GoodixReadLarge(
+        pDevice,
+        pDevice->FwBufferAddress,
+        verifyBuffer,
+        packageInfo.ConfigLength);
+    if (!NT_SUCCESS(status)) {
+        goto SendExit;
+    }
+
+    if (RtlCompareMemory(verifyBuffer, packageInfo.ConfigData, packageInfo.ConfigLength) != packageInfo.ConfigLength) {
+        status = STATUS_DATA_ERROR;
+        goto SendExit;
+    }
+
+    status = GoodixSendConfigCommand(pDevice, GOODIX_CFG_CMD_WRITE);
+    if (NT_SUCCESS(status)) {
+        pDevice->ConfigApplied = TRUE;
+        GoodixDelayMilliseconds(100);
+    }
+
+SendExit:
+    {
+        NTSTATUS exitStatus = GoodixSendConfigCommand(pDevice, GOODIX_CFG_CMD_EXIT);
+        if (NT_SUCCESS(status) && !NT_SUCCESS(exitStatus)) {
+            status = exitStatus;
+        }
+    }
+
+Exit:
+    ExFreePoolWithTag(verifyBuffer, TOUCH_POOL_TAG);
+    return status;
 }
 
 NTSTATUS

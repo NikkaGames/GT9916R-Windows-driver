@@ -46,6 +46,7 @@ Environment:
 #define TOUCH_INFO_ADDR         0x10308
 #define CMD_ADDR                0x10180
 #define TOUCH_POOL_TAG          (ULONG)'dooG'
+#define GOODIX_IC_INFO_MAX_LEN  1024
 
 #define GOODIX_REPORT_RATE_120HZ 0
 #define GOODIX_REPORT_RATE_240HZ 1
@@ -73,6 +74,53 @@ typedef struct _GOODIX_FW_VERSION {
     UINT8 Reserved[2];
     UINT16 Checksum;
 } GOODIX_FW_VERSION, *PGOODIX_FW_VERSION;
+
+#pragma warning(push)
+#pragma warning(disable:4201)
+#pragma pack(push, 1)
+typedef struct _GOODIX_IC_INFO_MISC {
+    UINT32 CmdAddress;
+    UINT16 CmdMaxLength;
+    UINT32 CmdReplyAddress;
+    UINT16 CmdReplyLength;
+    UINT32 FwStateAddress;
+    UINT16 FwStateLength;
+    UINT32 FwBufferAddress;
+    UINT16 FwBufferMaxLength;
+    UINT32 FrameDataAddress;
+    UINT16 FrameDataHeadLength;
+    UINT16 FwAttrLength;
+    UINT16 FwLogLength;
+    UINT8 PackMaxNum;
+    UINT8 PackCompressVersion;
+    UINT16 StylusStructLength;
+    UINT16 MutualStructLength;
+    UINT16 SelfStructLength;
+    UINT16 NoiseStructLength;
+    UINT32 TouchDataAddress;
+    UINT16 TouchDataHeadLength;
+    UINT16 PointStructLength;
+    UINT16 Reserved1;
+    UINT16 Reserved2;
+    UINT32 MutualRawDataAddress;
+    UINT32 MutualDiffDataAddress;
+    UINT32 MutualRefDataAddress;
+    UINT32 SelfRawDataAddress;
+    UINT32 SelfDiffDataAddress;
+    UINT32 SelfRefDataAddress;
+    UINT32 IqRawDataAddress;
+    UINT32 IqRefDataAddress;
+    UINT32 ImRawDataAddress;
+    UINT16 ImRawDataLength;
+    UINT32 NoiseRawDataAddress;
+    UINT16 NoiseRawDataLength;
+    UINT32 StylusRawDataAddress;
+    UINT16 StylusRawDataLength;
+    UINT32 NoiseDataAddress;
+    UINT32 EsdAddress;
+} GOODIX_IC_INFO_MISC, *PGOODIX_IC_INFO_MISC;
+#pragma pack(pop)
+#pragma warning(pop)
 
 #pragma warning(push)
 #pragma warning(disable:4201)
@@ -127,6 +175,10 @@ typedef struct _DEVICE_CONTEXT
     BOOLEAN                 VersionValid;
     ULONG                   TouchDataAddress;
     ULONG                   CommandAddress;
+    ULONG                   FwBufferAddress;
+    USHORT                  FwBufferMaxLength;
+    BOOLEAN                 IcInfoValid;
+    BOOLEAN                 ConfigApplied;
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetDeviceContext);
@@ -295,6 +347,16 @@ NTSTATUS
 GoodixApplyReportRate(
     _In_ PDEVICE_CONTEXT pDevice,
     _In_ UINT8 ReportRateLevel
+    );
+
+NTSTATUS
+GoodixReadIcInfo(
+    _In_ PDEVICE_CONTEXT pDevice
+    );
+
+NTSTATUS
+GoodixApplyEmbeddedConfig(
+    _In_ PDEVICE_CONTEXT pDevice
     );
 
 NTSTATUS
