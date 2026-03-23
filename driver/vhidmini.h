@@ -147,6 +147,7 @@ DRIVER_INITIALIZE                   DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD           EvtDeviceAdd;
 EVT_WDF_TIMER                       EvtTimerFunc;
 EVT_WDF_OBJECT_CONTEXT_CLEANUP      EvtDriverCleanup;
+EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL  GoodixControlEvtIoDeviceControl;
 
 EVT_WDF_DEVICE_PREPARE_HARDWARE      OnPrepareHardware;
 EVT_WDF_DEVICE_RELEASE_HARDWARE      OnReleaseHardware;
@@ -188,6 +189,16 @@ typedef struct _DEVICE_CONTEXT
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetDeviceContext);
+
+typedef struct _DRIVER_CONTEXT
+{
+    WDFDEVICE   ControlDevice;
+    WDFQUEUE    ControlQueue;
+    WDFWAITLOCK ControlLock;
+    WDFDEVICE   ActiveTouchDevice;
+} DRIVER_CONTEXT, *PDRIVER_CONTEXT;
+
+WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DRIVER_CONTEXT, GetDriverContext);
 
 typedef struct _QUEUE_CONTEXT
 {
@@ -257,6 +268,13 @@ NTSTATUS
 SetOutputReport(
     _In_  PQUEUE_CONTEXT    QueueContext,
     _In_  WDFREQUEST        Request
+    );
+
+NTSTATUS
+GoodixProcessControlRequest(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _In_ WDFREQUEST Request,
+    _In_ ULONG IoControlCode
     );
 
 NTSTATUS

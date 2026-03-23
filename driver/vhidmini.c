@@ -103,6 +103,10 @@ static NTSTATUS GoodixResetDevice(_In_ PDEVICE_CONTEXT DeviceContext, _In_ ULONG
 static NTSTATUS GoodixParseEmbeddedFirmware(_Out_ PGOODIX_PARSED_FW ParsedFirmware);
 static NTSTATUS GoodixMaybeUpdateFirmware(_In_ PDEVICE_CONTEXT DeviceContext, _Inout_ PGOODIX_FW_VERSION Version);
 static VOID GoodixHandleControllerRequest(_In_ PDEVICE_CONTEXT DeviceContext, _In_ UINT8 RequestCode);
+static NTSTATUS GoodixCreateControlDevice(_In_ WDFDRIVER Driver);
+static VOID GoodixSetActiveTouchDevice(_In_ WDFDRIVER Driver, _In_opt_ WDFDEVICE Device);
+static PDEVICE_CONTEXT GoodixAcquireActiveDeviceContext(_In_ WDFDRIVER Driver, _Out_opt_ WDFDEVICE* ReferencedDevice);
+static VOID GoodixReleaseActiveDevice(_In_opt_ WDFDEVICE Device);
 
 typedef struct _GOODIX_CFG_PACKAGE_INFO {
     const UINT8* ConfigData;
@@ -988,6 +992,7 @@ Return Value:
     WDF_DRIVER_CONFIG       config;
     WDF_OBJECT_ATTRIBUTES driverAttributes;
     NTSTATUS                status;
+    WDFDRIVER               driver;
     WPP_INIT_TRACING(DriverObject, RegistryPath);
     TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "George Droid on command. :D");
 #ifdef _KERNEL_MODE
@@ -1003,7 +1008,7 @@ Return Value:
 
     TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "Driver Init.");
 
-    WDF_OBJECT_ATTRIBUTES_INIT(&driverAttributes);
+    WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&driverAttributes, DRIVER_CONTEXT);
     TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "Attributes Init.");
     driverAttributes.EvtCleanupCallback = EvtDriverCleanup;
 
@@ -1011,10 +1016,30 @@ Return Value:
                             RegistryPath,
                             &driverAttributes,
                             &config,
-                            WDF_NO_HANDLE);
+                            &driver);
     if (!NT_SUCCESS(status)) {
 
         goto Exit;
+    }
+
+    {
+        PDRIVER_CONTEXT driverContext;
+        WDF_OBJECT_ATTRIBUTES lockAttributes;
+
+        driverContext = GetDriverContext(driver);
+        RtlZeroMemory(driverContext, sizeof(*driverContext));
+
+        WDF_OBJECT_ATTRIBUTES_INIT(&lockAttributes);
+        lockAttributes.ParentObject = driver;
+        status = WdfWaitLockCreate(&lockAttributes, &driverContext->ControlLock);
+        if (!NT_SUCCESS(status)) {
+            goto Exit;
+        }
+
+        status = GoodixCreateControlDevice(driver);
+        if (!NT_SUCCESS(status)) {
+            goto Exit;
+        }
     }
 Exit:
     return status;
@@ -1025,6 +1050,163 @@ EvtDriverCleanup(
 )
 {
     WPP_CLEANUP(WdfDriverWdmGetDriverObject((WDFDRIVER)Object));
+}
+
+static
+NTSTATUS
+GoodixCreateControlDevice(
+    _In_ WDFDRIVER Driver
+    )
+{
+    NTSTATUS status;
+    PWDFDEVICE_INIT controlInit;
+    WDFDEVICE controlDevice;
+    WDF_IO_QUEUE_CONFIG queueConfig;
+    WDF_OBJECT_ATTRIBUTES deviceAttributes;
+    UNICODE_STRING deviceName;
+    UNICODE_STRING symbolicLinkName;
+    UNICODE_STRING sddl;
+    PDRIVER_CONTEXT driverContext;
+
+    RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;BU)");
+    controlInit = WdfControlDeviceInitAllocate(
+        Driver,
+        &sddl);
+    if (controlInit == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlInitUnicodeString(&deviceName, GOODIX_TOUCH_CONTROL_NT_DEVICE_NAME);
+    status = WdfDeviceInitAssignName(controlInit, &deviceName);
+    if (!NT_SUCCESS(status)) {
+        WdfDeviceInitFree(controlInit);
+        return status;
+    }
+
+    WdfDeviceInitSetDeviceType(controlInit, FILE_DEVICE_UNKNOWN);
+    WdfDeviceInitSetExclusive(controlInit, FALSE);
+
+    WDF_OBJECT_ATTRIBUTES_INIT(&deviceAttributes);
+    status = WdfDeviceCreate(&controlInit, &deviceAttributes, &controlDevice);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchSequential);
+    queueConfig.EvtIoDeviceControl = GoodixControlEvtIoDeviceControl;
+
+    status = WdfIoQueueCreate(
+        controlDevice,
+        &queueConfig,
+        WDF_NO_OBJECT_ATTRIBUTES,
+        &GetDriverContext(Driver)->ControlQueue);
+    if (!NT_SUCCESS(status)) {
+        WdfObjectDelete(controlDevice);
+        return status;
+    }
+
+    RtlInitUnicodeString(&symbolicLinkName, GOODIX_TOUCH_CONTROL_DOS_DEVICE_NAME);
+    status = WdfDeviceCreateSymbolicLink(controlDevice, &symbolicLinkName);
+    if (!NT_SUCCESS(status)) {
+        WdfObjectDelete(controlDevice);
+        return status;
+    }
+
+    driverContext = GetDriverContext(Driver);
+    driverContext->ControlDevice = controlDevice;
+    WdfControlFinishInitializing(controlDevice);
+    return STATUS_SUCCESS;
+}
+
+static
+VOID
+GoodixSetActiveTouchDevice(
+    _In_ WDFDRIVER Driver,
+    _In_opt_ WDFDEVICE Device
+    )
+{
+    PDRIVER_CONTEXT driverContext;
+
+    driverContext = GetDriverContext(Driver);
+    WdfWaitLockAcquire(driverContext->ControlLock, NULL);
+    driverContext->ActiveTouchDevice = Device;
+    WdfWaitLockRelease(driverContext->ControlLock);
+}
+
+static
+PDEVICE_CONTEXT
+GoodixAcquireActiveDeviceContext(
+    _In_ WDFDRIVER Driver,
+    _Out_opt_ WDFDEVICE* ReferencedDevice
+    )
+{
+    PDRIVER_CONTEXT driverContext;
+    WDFDEVICE device;
+
+    if (ReferencedDevice != NULL) {
+        *ReferencedDevice = NULL;
+    }
+
+    driverContext = GetDriverContext(Driver);
+    WdfWaitLockAcquire(driverContext->ControlLock, NULL);
+    device = driverContext->ActiveTouchDevice;
+    if (device != NULL) {
+        WdfObjectReference(device);
+    }
+    WdfWaitLockRelease(driverContext->ControlLock);
+
+    if (ReferencedDevice != NULL) {
+        *ReferencedDevice = device;
+    }
+
+    if (device == NULL) {
+        return NULL;
+    }
+
+    return GetDeviceContext(device);
+}
+
+static
+VOID
+GoodixReleaseActiveDevice(
+    _In_opt_ WDFDEVICE Device
+    )
+{
+    if (Device != NULL) {
+        WdfObjectDereference(Device);
+    }
+}
+
+VOID
+GoodixControlEvtIoDeviceControl(
+    _In_ WDFQUEUE Queue,
+    _In_ WDFREQUEST Request,
+    _In_ size_t OutputBufferLength,
+    _In_ size_t InputBufferLength,
+    _In_ ULONG IoControlCode
+    )
+{
+    WDFDEVICE controlDevice;
+    WDFDRIVER driver;
+    WDFDEVICE activeDevice;
+    PDEVICE_CONTEXT deviceContext;
+    NTSTATUS status;
+
+    UNREFERENCED_PARAMETER(OutputBufferLength);
+    UNREFERENCED_PARAMETER(InputBufferLength);
+
+    controlDevice = WdfIoQueueGetDevice(Queue);
+    driver = WdfDeviceGetDriver(controlDevice);
+    activeDevice = NULL;
+    deviceContext = GoodixAcquireActiveDeviceContext(driver, &activeDevice);
+    if (deviceContext == NULL) {
+        WdfRequestComplete(Request, STATUS_DEVICE_NOT_READY);
+        return;
+    }
+
+    status = GoodixProcessControlRequest(deviceContext, Request, IoControlCode);
+    GoodixReleaseActiveDevice(activeDevice);
+    WdfRequestComplete(Request, status);
 }
 
 NTSTATUS
@@ -1072,23 +1254,6 @@ Return Value:
     //
     WdfFdoInitSetFilter(DeviceInit);
 
-    {
-        UNICODE_STRING deviceName;
-        UNICODE_STRING sddl;
-
-        RtlInitUnicodeString(&deviceName, GOODIX_TOUCH_CONTROL_NT_DEVICE_NAME);
-        status = WdfDeviceInitAssignName(DeviceInit, &deviceName);
-        if (!NT_SUCCESS(status)) {
-            return status;
-        }
-
-        RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;BU)");
-        status = WdfDeviceInitAssignSDDLString(DeviceInit, &sddl);
-        if (!NT_SUCCESS(status)) {
-            return status;
-        }
-    }
-
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnpCallbacks);
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(
@@ -1108,16 +1273,6 @@ Return Value:
         NULL);
     if (!NT_SUCCESS(status)) {
         return status;
-    }
-
-    {
-        UNICODE_STRING symbolicLinkName;
-
-        RtlInitUnicodeString(&symbolicLinkName, GOODIX_TOUCH_CONTROL_DOS_DEVICE_NAME);
-        status = WdfDeviceCreateSymbolicLink(device, &symbolicLinkName);
-        if (!NT_SUCCESS(status)) {
-            return status;
-        }
     }
 
     deviceContext = GetDeviceContext(device);
@@ -1422,6 +1577,7 @@ NTSTATUS
 {
     PDEVICE_CONTEXT pDevice = GetDeviceContext(FxDevice);
     UNREFERENCED_PARAMETER(FxResourcesTranslated);
+    GoodixSetActiveTouchDevice(WdfDeviceGetDriver(FxDevice), NULL);
     GoodixCloseResetGpio(pDevice);
     if (pDevice->Interrupt != NULL)
     {
@@ -1550,6 +1706,10 @@ OnD0Entry(
             pDevice->ReportRateLevel);
     }
 
+    if (NT_SUCCESS(status)) {
+        GoodixSetActiveTouchDevice(WdfDeviceGetDriver(FxDevice), FxDevice);
+    }
+
     return status;
 }
 
@@ -1601,6 +1761,86 @@ GoodixHandleControllerRequest(
 }
 
 NTSTATUS
+GoodixProcessControlRequest(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _In_ WDFREQUEST Request,
+    _In_ ULONG IoControlCode
+    )
+{
+    NTSTATUS status;
+
+    switch (IoControlCode)
+    {
+    case IOCTL_GOODIX_TOUCH_GET_REPORT_RATE:
+    {
+        PGOODIX_TOUCH_REPORT_RATE_STATE rateState = NULL;
+        size_t bufferLength = 0;
+
+        status = WdfRequestRetrieveOutputBuffer(
+            Request,
+            sizeof(*rateState),
+            (PVOID*)&rateState,
+            &bufferLength);
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+
+        UNREFERENCED_PARAMETER(bufferLength);
+        rateState->PersistentLevel = DeviceContext->ReportRateLevel;
+        rateState->ActiveLevel =
+            (DeviceContext->ActiveReportRateLevel == 0xFF)
+            ? DeviceContext->ReportRateLevel
+            : DeviceContext->ActiveReportRateLevel;
+        WdfRequestSetInformation(Request, sizeof(*rateState));
+        return STATUS_SUCCESS;
+    }
+
+    case IOCTL_GOODIX_TOUCH_SET_REPORT_RATE:
+    {
+        PGOODIX_REPORT_RATE_CONTROL reportRateControl = NULL;
+        size_t bufferLength = 0;
+        UINT8 requestedLevel;
+
+        status = WdfRequestRetrieveInputBuffer(
+            Request,
+            sizeof(*reportRateControl),
+            (PVOID*)&reportRateControl,
+            &bufferLength);
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+
+        requestedLevel = GoodixNormalizeReportRateLevel((UINT8)reportRateControl->Level);
+        UNREFERENCED_PARAMETER(bufferLength);
+
+        DeviceContext->ReportRateLevel = requestedLevel;
+        status = GoodixApplyReportRate(DeviceContext, requestedLevel);
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+
+        {
+            NTSTATUS persistStatus = GoodixPersistReportRateLevel(DeviceContext, requestedLevel);
+            if (!NT_SUCCESS(persistStatus)) {
+                TraceEvents(
+                    TRACE_LEVEL_WARNING,
+                    TRACE_DEVICE,
+                    "GoodixPersistReportRateLevel failed level=%u status=0x%08X",
+                    requestedLevel,
+                    persistStatus);
+            }
+        }
+
+        WdfRequestSetInformation(Request, sizeof(*reportRateControl));
+        return STATUS_SUCCESS;
+    }
+
+    default:
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+}
+
+NTSTATUS
 OnD0Exit(
     _In_  WDFDEVICE               FxDevice,
     _In_  WDF_POWER_DEVICE_STATE  FxPreviousState
@@ -1625,6 +1865,7 @@ OnD0Exit(
     UNREFERENCED_PARAMETER(FxPreviousState);
 
     PDEVICE_CONTEXT pDevice = GetDeviceContext(FxDevice);
+    GoodixSetActiveTouchDevice(WdfDeviceGetDriver(FxDevice), NULL);
     GoodixCloseResetGpio(pDevice);
     SpbDeviceClose(pDevice);
     if (pDevice->SpbController != WDF_NO_HANDLE)
@@ -1761,61 +2002,9 @@ Return Value:
     switch (IoControlCode)
     {
     case IOCTL_GOODIX_TOUCH_GET_REPORT_RATE:
-    {
-        PGOODIX_TOUCH_REPORT_RATE_STATE rateState = NULL;
-        size_t bufferLength = 0;
-
-        status = WdfRequestRetrieveOutputBuffer(
-            Request,
-            sizeof(*rateState),
-            (PVOID*)&rateState,
-            &bufferLength);
-        if (NT_SUCCESS(status)) {
-            UNREFERENCED_PARAMETER(bufferLength);
-            rateState->PersistentLevel = queueContext->DeviceContext->ReportRateLevel;
-            rateState->ActiveLevel =
-                (queueContext->DeviceContext->ActiveReportRateLevel == 0xFF)
-                ? queueContext->DeviceContext->ReportRateLevel
-                : queueContext->DeviceContext->ActiveReportRateLevel;
-            WdfRequestSetInformation(Request, sizeof(*rateState));
-        }
-        break;
-    }
-
     case IOCTL_GOODIX_TOUCH_SET_REPORT_RATE:
-    {
-        PGOODIX_REPORT_RATE_CONTROL reportRateControl = NULL;
-        size_t bufferLength = 0;
-
-        status = WdfRequestRetrieveInputBuffer(
-            Request,
-            sizeof(*reportRateControl),
-            (PVOID*)&reportRateControl,
-            &bufferLength);
-        if (NT_SUCCESS(status)) {
-            UINT8 requestedLevel =
-                GoodixNormalizeReportRateLevel((UINT8)reportRateControl->Level);
-
-            UNREFERENCED_PARAMETER(bufferLength);
-            queueContext->DeviceContext->ReportRateLevel = requestedLevel;
-            status = GoodixApplyReportRate(queueContext->DeviceContext, requestedLevel);
-            if (NT_SUCCESS(status)) {
-                NTSTATUS persistStatus = GoodixPersistReportRateLevel(
-                    queueContext->DeviceContext,
-                    requestedLevel);
-                if (!NT_SUCCESS(persistStatus)) {
-                    TraceEvents(
-                        TRACE_LEVEL_WARNING,
-                        TRACE_DEVICE,
-                        "GoodixPersistReportRateLevel failed level=%u status=0x%08X",
-                        requestedLevel,
-                        persistStatus);
-                }
-                WdfRequestSetInformation(Request, sizeof(*reportRateControl));
-            }
-        }
+        status = GoodixProcessControlRequest(queueContext->DeviceContext, Request, IoControlCode);
         break;
-    }
 
     case IOCTL_HID_GET_DEVICE_DESCRIPTOR:   // METHOD_NEITHER
         //
