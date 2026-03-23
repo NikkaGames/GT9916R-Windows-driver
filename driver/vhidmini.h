@@ -28,6 +28,7 @@ Environment:
 
 #include <spb.h>
 #include <wdf.h>
+#include <gpio.h>
 
 #include <hidport.h>  // located in $(DDK_INC_PATH)/wdm
 
@@ -164,10 +165,13 @@ typedef struct _DEVICE_CONTEXT
     BOOLEAN                 ReadReportDescFromRegistry;
 
     LARGE_INTEGER           PeripheralId;
+    LARGE_INTEGER           ResetGpioId;
     WDFINTERRUPT            Interrupt;
     WDFIOTARGET             SpbController;
+    WDFIOTARGET             ResetGpioIoTarget;
     WDFWAITLOCK             IoLock;
     BOOLEAN                 OnClose;
+    BOOLEAN                 ResetGpioPresent;
     UINT8                   LastTouchID;
     UINT8                   ReportRateLevel;
     UINT8                   ActiveReportRateLevel;
@@ -179,6 +183,7 @@ typedef struct _DEVICE_CONTEXT
     USHORT                  FwBufferMaxLength;
     BOOLEAN                 IcInfoValid;
     BOOLEAN                 ConfigApplied;
+    BOOLEAN                 FirmwareUpdated;
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetDeviceContext);

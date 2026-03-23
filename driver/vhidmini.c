@@ -17,6 +17,7 @@ Environment:
 --*/
 #include "vhidmini.h"
 #include "goodix_9916r_blobs.h"
+#include "goodix_9916r_firmware.h"
 
 #define DEBUG
 
@@ -54,6 +55,56 @@ Environment:
 #define GOODIX_CFG_CMD_STATUS_PASS         0x80U
 #define GOODIX_CFG_CMD_WAIT_RETRY          20U
 #define GOODIX_CFG_TRANSFER_CHUNK          240U
+
+#define GOODIX_FW_HEADER_SIZE              512U
+#define GOODIX_FW_SUBSYS_INFO_SIZE         10U
+#define GOODIX_FW_SUBSYS_INFO_OFFSET       42U
+#define GOODIX_FW_SUBSYS_MAX_NUM           47U
+#define GOODIX_FW_FILE_CHECKSUM_OFFSET     8U
+#define GOODIX_FW_PACKET_MAX_SIZE          4096U
+
+#define GOODIX_FW_BRD_CHIP_TYPE            0x98U
+#define GOODIX_FW_ISP_RAM_ADDR_BRD         0x23800U
+#define GOODIX_FW_CPU_RUN_FROM_REG         0x10000U
+#define GOODIX_FW_FLASH_CMD_REG_BRD        0x12400U
+#define GOODIX_FW_ISP_BUFFER_REG_BRD       0x12410U
+#define GOODIX_FW_MISCTL_REG_BRD           0xD804U
+#define GOODIX_FW_WATCHDOG_REG_BRD         0xD040U
+#define GOODIX_FW_HOLD_CPU_REG_W           0x0002U
+#define GOODIX_FW_HOLD_CPU_REG_R           0x2000U
+#define GOODIX_FW_ENABLE_MISCTL_BRD        0x20700000U
+
+#define GOODIX_FLASH_CMD_TYPE_WRITE        0xBBU
+#define GOODIX_FLASH_CMD_ACK_CHK_PASS      0xEEU
+#define GOODIX_FLASH_CMD_STATUS_WRITE_OK   0xEEU
+#define GOODIX_FLASH_CMD_STATUS_CHK_FAIL   0x33U
+#define GOODIX_FLASH_CMD_STATUS_ADDR_ERR   0x44U
+#define GOODIX_FLASH_CMD_STATUS_WRITE_ERR  0x55U
+#define GOODIX_FLASH_CMD_LEN               11U
+
+typedef struct _GOODIX_FW_SUBSYS {
+    UINT8 Type;
+    UINT32 Size;
+    UINT32 FlashAddress;
+    const UINT8* Data;
+} GOODIX_FW_SUBSYS, *PGOODIX_FW_SUBSYS;
+
+typedef struct _GOODIX_PARSED_FW {
+    UINT8 FwPid[8];
+    UINT8 FwVid[4];
+    UINT8 SubsysNum;
+    UINT8 ChipType;
+    UINT8 ProtocolVer;
+    UINT8 BusType;
+    UINT8 FlashProtect;
+    GOODIX_FW_SUBSYS Subsys[GOODIX_FW_SUBSYS_MAX_NUM];
+} GOODIX_PARSED_FW, *PGOODIX_PARSED_FW;
+
+static NTSTATUS GoodixOpenResetGpio(_In_ PDEVICE_CONTEXT DeviceContext);
+static VOID GoodixCloseResetGpio(_In_ PDEVICE_CONTEXT DeviceContext);
+static NTSTATUS GoodixResetDevice(_In_ PDEVICE_CONTEXT DeviceContext, _In_ ULONG DelayMs);
+static NTSTATUS GoodixParseEmbeddedFirmware(_Out_ PGOODIX_PARSED_FW ParsedFirmware);
+static NTSTATUS GoodixMaybeUpdateFirmware(_In_ PDEVICE_CONTEXT DeviceContext, _Inout_ PGOODIX_FW_VERSION Version);
 
 typedef struct _GOODIX_CFG_PACKAGE_INFO {
     const UINT8* ConfigData;
@@ -98,6 +149,32 @@ GoodixAppendChecksumU8Le(
 
     Data[Length] = (UINT8)(checksum & 0xFF);
     Data[Length + 1] = (UINT8)((checksum >> 8) & 0xFF);
+}
+
+static
+VOID
+GoodixAppendChecksumU16Le(
+    _Inout_updates_bytes_(Length + 4) PUINT8 Data,
+    _In_ ULONG Length
+    )
+{
+    ULONG checksum = 0;
+    ULONG i;
+
+    for (i = 0; i < Length; i += 2) {
+        USHORT value = Data[i];
+
+        if ((i + 1) < Length) {
+            value |= ((USHORT)Data[i + 1] << 8);
+        }
+
+        checksum += value;
+    }
+
+    Data[Length] = (UINT8)(checksum & 0xFF);
+    Data[Length + 1] = (UINT8)((checksum >> 8) & 0xFF);
+    Data[Length + 2] = (UINT8)((checksum >> 16) & 0xFF);
+    Data[Length + 3] = (UINT8)((checksum >> 24) & 0xFF);
 }
 
 static
@@ -989,6 +1066,8 @@ Return Value:
     deviceContext->Device       = device;
     deviceContext->DeviceData = 0;
     deviceContext->OnClose = FALSE;
+    deviceContext->ResetGpioId.QuadPart = 0;
+    deviceContext->ResetGpioPresent = FALSE;
     deviceContext->ReportRateLevel = GOODIX_REPORT_RATE_240HZ;
     deviceContext->ActiveReportRateLevel = 0xFF;
     deviceContext->SensorId = 0;
@@ -999,6 +1078,9 @@ Return Value:
     deviceContext->FwBufferMaxLength = 0;
     deviceContext->IcInfoValid = FALSE;
     deviceContext->ConfigApplied = FALSE;
+    deviceContext->FirmwareUpdated = FALSE;
+    deviceContext->SpbController = WDF_NO_HANDLE;
+    deviceContext->ResetGpioIoTarget = WDF_NO_HANDLE;
 
     status = WdfWaitLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &deviceContext->IoLock);
     if (!NT_SUCCESS(status)) {
@@ -1124,6 +1206,7 @@ NTSTATUS
     PDEVICE_CONTEXT pDevice = GetDeviceContext(FxDevice);
     BOOLEAN fSpbResourceFound = FALSE;
     BOOLEAN fInterruptResourceFound = FALSE;
+    BOOLEAN fResetGpioFound = FALSE;
     ULONG interruptIndex = 0;
     NTSTATUS status = STATUS_SUCCESS;
 
@@ -1166,6 +1249,19 @@ NTSTATUS
                         pDescriptor->u.Connection.IdHighPart;
 
                     fSpbResourceFound = TRUE;
+                }
+            }
+            else if ((Class == CM_RESOURCE_CONNECTION_CLASS_GPIO) &&
+                (Type == CM_RESOURCE_CONNECTION_TYPE_GPIO_IO))
+            {
+                if (fResetGpioFound == FALSE)
+                {
+                    pDevice->ResetGpioId.LowPart =
+                        pDescriptor->u.Connection.IdLowPart;
+                    pDevice->ResetGpioId.HighPart =
+                        pDescriptor->u.Connection.IdHighPart;
+                    pDevice->ResetGpioPresent = TRUE;
+                    fResetGpioFound = TRUE;
                 }
             }
 
@@ -1266,6 +1362,7 @@ NTSTATUS
 {
     PDEVICE_CONTEXT pDevice = GetDeviceContext(FxDevice);
     UNREFERENCED_PARAMETER(FxResourcesTranslated);
+    GoodixCloseResetGpio(pDevice);
     if (pDevice->Interrupt != NULL)
     {
         WdfObjectDelete(pDevice->Interrupt);
@@ -1327,6 +1424,16 @@ OnD0Entry(
         return status;
     }
 
+    if (pDevice->ResetGpioPresent) {
+        status = GoodixOpenResetGpio(pDevice);
+        if (!NT_SUCCESS(status)) {
+#ifdef DEBUG
+            TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "GoodixOpenResetGpio failed status=0x%08X", status);
+#endif
+            status = STATUS_SUCCESS;
+        }
+    }
+
     if (pDevice->Interrupt != NULL) {
         WdfInterruptDisable(pDevice->Interrupt);
     }
@@ -1350,6 +1457,19 @@ OnD0Entry(
 #ifdef DEBUG
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "GoodixReadVersion failed status=0x%08X", status);
 #endif
+    }
+
+    if (pDevice->VersionValid) {
+        status = GoodixMaybeUpdateFirmware(pDevice, &version);
+        if (NT_SUCCESS(status)) {
+            pDevice->SensorId = version.SensorId;
+            pDevice->VersionValid = TRUE;
+        } else {
+#ifdef DEBUG
+            TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "GoodixMaybeUpdateFirmware failed status=0x%08X", status);
+#endif
+            status = STATUS_SUCCESS;
+        }
     }
 
     status = GoodixReadIcInfo(pDevice);
@@ -1410,6 +1530,7 @@ OnD0Exit(
     UNREFERENCED_PARAMETER(FxPreviousState);
 
     PDEVICE_CONTEXT pDevice = GetDeviceContext(FxDevice);
+    GoodixCloseResetGpio(pDevice);
     SpbDeviceClose(pDevice);
     if (pDevice->SpbController != WDF_NO_HANDLE)
     {
@@ -2745,6 +2866,611 @@ GoodixWrite(
 
     ExFreePoolWithTag(SpbBuf, TOUCH_POOL_TAG);
     return status;
+}
+
+static
+NTSTATUS
+GoodixOpenResetGpio(
+    _In_ PDEVICE_CONTEXT DeviceContext
+    )
+{
+    NTSTATUS status;
+    WDF_OBJECT_ATTRIBUTES targetAttributes;
+    WDF_IO_TARGET_OPEN_PARAMS openParams;
+    DECLARE_UNICODE_STRING_SIZE(devicePath, RESOURCE_HUB_PATH_SIZE);
+
+    if (!DeviceContext->ResetGpioPresent) {
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    if (DeviceContext->ResetGpioIoTarget != WDF_NO_HANDLE) {
+        return STATUS_SUCCESS;
+    }
+
+    status = RESOURCE_HUB_CREATE_PATH_FROM_ID(
+        &devicePath,
+        DeviceContext->ResetGpioId.LowPart,
+        DeviceContext->ResetGpioId.HighPart);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    WDF_OBJECT_ATTRIBUTES_INIT(&targetAttributes);
+    status = WdfIoTargetCreate(
+        DeviceContext->Device,
+        &targetAttributes,
+        &DeviceContext->ResetGpioIoTarget);
+    if (!NT_SUCCESS(status)) {
+        DeviceContext->ResetGpioIoTarget = WDF_NO_HANDLE;
+        return status;
+    }
+
+    WDF_IO_TARGET_OPEN_PARAMS_INIT_OPEN_BY_NAME(
+        &openParams,
+        &devicePath,
+        GENERIC_WRITE);
+    openParams.ShareAccess = 0;
+    openParams.CreateDisposition = FILE_OPEN;
+    openParams.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+
+    status = WdfIoTargetOpen(DeviceContext->ResetGpioIoTarget, &openParams);
+    if (!NT_SUCCESS(status)) {
+        WdfObjectDelete(DeviceContext->ResetGpioIoTarget);
+        DeviceContext->ResetGpioIoTarget = WDF_NO_HANDLE;
+    }
+
+    return status;
+}
+
+static
+VOID
+GoodixCloseResetGpio(
+    _In_ PDEVICE_CONTEXT DeviceContext
+    )
+{
+    if (DeviceContext->ResetGpioIoTarget != WDF_NO_HANDLE) {
+        WdfIoTargetClose(DeviceContext->ResetGpioIoTarget);
+        WdfObjectDelete(DeviceContext->ResetGpioIoTarget);
+        DeviceContext->ResetGpioIoTarget = WDF_NO_HANDLE;
+    }
+}
+
+static
+NTSTATUS
+GoodixWriteResetGpio(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _In_ BOOLEAN Level
+    )
+{
+    UCHAR value = Level ? 1U : 0U;
+    WDF_MEMORY_DESCRIPTOR inputDescriptor;
+    WDF_MEMORY_DESCRIPTOR outputDescriptor;
+
+    if (DeviceContext->ResetGpioIoTarget == WDF_NO_HANDLE) {
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&inputDescriptor, &value, sizeof(value));
+    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&outputDescriptor, &value, sizeof(value));
+
+    return WdfIoTargetSendIoctlSynchronously(
+        DeviceContext->ResetGpioIoTarget,
+        NULL,
+        IOCTL_GPIO_WRITE_PINS,
+        &inputDescriptor,
+        &outputDescriptor,
+        NULL,
+        NULL);
+}
+
+static
+NTSTATUS
+GoodixResetDevice(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _In_ ULONG DelayMs
+    )
+{
+    NTSTATUS status;
+
+    if (DeviceContext->ResetGpioIoTarget == WDF_NO_HANDLE) {
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    status = GoodixWriteResetGpio(DeviceContext, FALSE);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    GoodixDelayMilliseconds(2);
+
+    status = GoodixWriteResetGpio(DeviceContext, TRUE);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    if (DelayMs != 0) {
+        GoodixDelayMilliseconds((LONG)DelayMs);
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static
+NTSTATUS
+GoodixWriteConfirm(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _In_ UINT32 Address,
+    _In_reads_bytes_(Length) const UINT8* Buffer,
+    _In_ ULONG Length
+    )
+{
+    NTSTATUS status;
+    UINT8* readBack;
+
+    readBack = (UINT8*)ExAllocatePool2(POOL_FLAG_NON_PAGED, Length, TOUCH_POOL_TAG);
+    if (readBack == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    status = GoodixWriteLarge(DeviceContext, Address, Buffer, Length);
+    if (NT_SUCCESS(status)) {
+        status = GoodixReadLarge(DeviceContext, Address, readBack, Length);
+        if (NT_SUCCESS(status) && RtlCompareMemory(Buffer, readBack, Length) != Length) {
+            status = STATUS_CRC_ERROR;
+        }
+    }
+
+    ExFreePoolWithTag(readBack, TOUCH_POOL_TAG);
+    return status;
+}
+
+static
+NTSTATUS
+GoodixParseEmbeddedFirmware(
+    _Out_ PGOODIX_PARSED_FW ParsedFirmware
+    )
+{
+    const UINT8* firmware = g_GoodixFw9916rBin;
+    ULONG firmwareLength = g_GoodixFw9916rBinLen;
+    ULONG expectedSize;
+    ULONG checksum = 0;
+    ULONG infoOffset;
+    ULONG firmwareOffset;
+    ULONG i;
+
+    RtlZeroMemory(ParsedFirmware, sizeof(*ParsedFirmware));
+
+    if (firmwareLength < GOODIX_FW_HEADER_SIZE) {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    expectedSize = GoodixReadU32Le(&firmware[0]) + GOODIX_FW_FILE_CHECKSUM_OFFSET;
+    if (expectedSize != firmwareLength) {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    for (i = GOODIX_FW_FILE_CHECKSUM_OFFSET; (i + 1) < firmwareLength; i += 2) {
+        checksum += firmware[i] | ((ULONG)firmware[i + 1] << 8);
+    }
+
+    if (checksum != GoodixReadU32Le(&firmware[4])) {
+        return STATUS_CRC_ERROR;
+    }
+
+    RtlCopyMemory(ParsedFirmware->FwPid, &firmware[17], sizeof(ParsedFirmware->FwPid));
+    RtlCopyMemory(ParsedFirmware->FwVid, &firmware[25], sizeof(ParsedFirmware->FwVid));
+    ParsedFirmware->SubsysNum = firmware[29];
+    ParsedFirmware->ChipType = firmware[30];
+    ParsedFirmware->ProtocolVer = firmware[31];
+    ParsedFirmware->BusType = firmware[32];
+    ParsedFirmware->FlashProtect = firmware[33];
+
+    if (ParsedFirmware->ChipType != GOODIX_FW_BRD_CHIP_TYPE ||
+        ParsedFirmware->SubsysNum == 0 ||
+        ParsedFirmware->SubsysNum > GOODIX_FW_SUBSYS_MAX_NUM) {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    firmwareOffset = GOODIX_FW_HEADER_SIZE;
+    for (i = 0; i < ParsedFirmware->SubsysNum; i++) {
+        UINT32 size;
+
+        infoOffset = GOODIX_FW_SUBSYS_INFO_OFFSET + (i * GOODIX_FW_SUBSYS_INFO_SIZE);
+        size = GoodixReadU32Le(&firmware[infoOffset + 1]);
+        if ((firmwareOffset + size) > firmwareLength) {
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
+        ParsedFirmware->Subsys[i].Type = firmware[infoOffset];
+        ParsedFirmware->Subsys[i].Size = size;
+        ParsedFirmware->Subsys[i].FlashAddress = GoodixReadU32Le(&firmware[infoOffset + 5]);
+        ParsedFirmware->Subsys[i].Data = &firmware[firmwareOffset];
+        firmwareOffset += size;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static
+BOOLEAN
+GoodixFirmwareNeedsUpdate(
+    _In_ const GOODIX_FW_VERSION* Version,
+    _In_ const GOODIX_PARSED_FW* ParsedFirmware
+    )
+{
+    static const CHAR noCode[] = "NOCODE";
+
+    if (RtlCompareMemory(Version->RomPid, noCode, sizeof(noCode) - 1) == (sizeof(noCode) - 1) ||
+        RtlCompareMemory(Version->PatchPid, noCode, sizeof(noCode) - 1) == (sizeof(noCode) - 1)) {
+        return TRUE;
+    }
+
+    if (RtlCompareMemory(Version->PatchPid, ParsedFirmware->FwPid, sizeof(ParsedFirmware->FwPid)) != sizeof(ParsedFirmware->FwPid)) {
+        return TRUE;
+    }
+
+    if (RtlCompareMemory(Version->PatchVid, ParsedFirmware->FwVid, sizeof(ParsedFirmware->FwVid)) != sizeof(ParsedFirmware->FwVid)) {
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+static
+NTSTATUS
+GoodixHoldCpu(
+    _In_ PDEVICE_CONTEXT DeviceContext
+    )
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    UINT8 regValue[2] = { 0x01, 0x00 };
+    UINT8 tempBuffer[12];
+    ULONG retry;
+
+    for (retry = 0; retry < 100; retry++) {
+        status = GoodixWrite(DeviceContext, GOODIX_FW_HOLD_CPU_REG_W, regValue, sizeof(regValue));
+        if (!NT_SUCCESS(status)) {
+            GoodixDelayMilliseconds(1);
+            continue;
+        }
+
+        status = GoodixRead(DeviceContext, GOODIX_FW_HOLD_CPU_REG_R, &tempBuffer[0], 4);
+        status = NT_SUCCESS(status) ? GoodixRead(DeviceContext, GOODIX_FW_HOLD_CPU_REG_R, &tempBuffer[4], 4) : status;
+        status = NT_SUCCESS(status) ? GoodixRead(DeviceContext, GOODIX_FW_HOLD_CPU_REG_R, &tempBuffer[8], 4) : status;
+        if (NT_SUCCESS(status) &&
+            RtlCompareMemory(&tempBuffer[0], &tempBuffer[4], 4) == 4 &&
+            RtlCompareMemory(&tempBuffer[4], &tempBuffer[8], 4) == 4) {
+            return STATUS_SUCCESS;
+        }
+
+        GoodixDelayMilliseconds(1);
+    }
+
+    return STATUS_IO_TIMEOUT;
+}
+
+static
+NTSTATUS
+GoodixLoadIsp(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _In_ const GOODIX_PARSED_FW* ParsedFirmware
+    )
+{
+    NTSTATUS status;
+    GOODIX_FW_VERSION ispVersion = { 0 };
+    UINT8 bootOption[8];
+
+    if (ParsedFirmware->SubsysNum == 0 || ParsedFirmware->Subsys[0].Size == 0) {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    status = GoodixWriteConfirm(
+        DeviceContext,
+        GOODIX_FW_ISP_RAM_ADDR_BRD,
+        ParsedFirmware->Subsys[0].Data,
+        ParsedFirmware->Subsys[0].Size);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    RtlFillMemory(bootOption, sizeof(bootOption), 0x55);
+    status = GoodixWriteConfirm(
+        DeviceContext,
+        GOODIX_FW_CPU_RUN_FROM_REG,
+        bootOption,
+        sizeof(bootOption));
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = GoodixResetDevice(DeviceContext, 100);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = GoodixReadVersion(DeviceContext, &ispVersion);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    if (RtlCompareMemory(&ispVersion.PatchPid[3], "ISP", 3) != 3) {
+        return STATUS_REVISION_MISMATCH;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static
+NTSTATUS
+GoodixUpdatePrepare(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _In_ const GOODIX_PARSED_FW* ParsedFirmware
+    )
+{
+    NTSTATUS status;
+    UINT32 misctlValue = GOODIX_FW_ENABLE_MISCTL_BRD;
+    UINT8 watchdog = 0x00;
+
+    UNREFERENCED_PARAMETER(ParsedFirmware);
+
+    status = GoodixResetDevice(DeviceContext, 5);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = GoodixHoldCpu(DeviceContext);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = GoodixWrite(DeviceContext, GOODIX_FW_MISCTL_REG_BRD, (UINT8*)&misctlValue, sizeof(misctlValue));
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = GoodixWrite(DeviceContext, GOODIX_FW_WATCHDOG_REG_BRD, &watchdog, sizeof(watchdog));
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    return GoodixLoadIsp(DeviceContext, ParsedFirmware);
+}
+
+static
+NTSTATUS
+GoodixSendFlashCmd(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _In_ UINT8 FwType,
+    _In_ UINT16 FwLength,
+    _In_ UINT32 FwAddress
+    )
+{
+    NTSTATUS status;
+    UINT8 cmd[16] = { 0 };
+    UINT8 ack[16] = { 0 };
+    ULONG i;
+
+    cmd[2] = GOODIX_FLASH_CMD_LEN;
+    cmd[3] = GOODIX_FLASH_CMD_TYPE_WRITE;
+    cmd[4] = FwType;
+    cmd[5] = (UINT8)(FwLength & 0xFF);
+    cmd[6] = (UINT8)((FwLength >> 8) & 0xFF);
+    cmd[7] = (UINT8)(FwAddress & 0xFF);
+    cmd[8] = (UINT8)((FwAddress >> 8) & 0xFF);
+    cmd[9] = (UINT8)((FwAddress >> 16) & 0xFF);
+    cmd[10] = (UINT8)((FwAddress >> 24) & 0xFF);
+    GoodixAppendChecksumU8Le(&cmd[2], 9);
+
+    status = GoodixWrite(DeviceContext, GOODIX_FW_FLASH_CMD_REG_BRD, cmd, sizeof(cmd));
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    for (i = 0; i < 5; i++) {
+        status = GoodixRead(DeviceContext, GOODIX_FW_FLASH_CMD_REG_BRD, ack, sizeof(ack));
+        if (NT_SUCCESS(status) && ack[1] == GOODIX_FLASH_CMD_ACK_CHK_PASS) {
+            break;
+        }
+        GoodixDelayMilliseconds(5);
+    }
+
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    if (ack[1] != GOODIX_FLASH_CMD_ACK_CHK_PASS) {
+        return STATUS_CRC_ERROR;
+    }
+
+    GoodixDelayMilliseconds(50);
+    for (i = 0; i < 20; i++) {
+        status = GoodixRead(DeviceContext, GOODIX_FW_FLASH_CMD_REG_BRD, ack, sizeof(ack));
+        if (NT_SUCCESS(status) &&
+            ack[1] == GOODIX_FLASH_CMD_ACK_CHK_PASS &&
+            ack[0] == GOODIX_FLASH_CMD_STATUS_WRITE_OK) {
+            return STATUS_SUCCESS;
+        }
+        GoodixDelayMilliseconds(10);
+    }
+
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    switch (ack[0]) {
+    case GOODIX_FLASH_CMD_STATUS_CHK_FAIL:
+    case GOODIX_FLASH_CMD_STATUS_WRITE_ERR:
+        return STATUS_RETRY;
+    case GOODIX_FLASH_CMD_STATUS_ADDR_ERR:
+        return STATUS_INVALID_ADDRESS;
+    default:
+        return STATUS_IO_DEVICE_ERROR;
+    }
+}
+
+static
+NTSTATUS
+GoodixFlashPackage(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _In_ UINT8 FwType,
+    _In_reads_bytes_(PackageLength) const UINT8* Package,
+    _In_ UINT32 FlashAddress,
+    _In_ UINT16 PackageLength
+    )
+{
+    NTSTATUS status;
+    ULONG retry;
+
+    for (retry = 0; retry < 2; retry++) {
+        status = GoodixWriteLarge(
+            DeviceContext,
+            GOODIX_FW_ISP_BUFFER_REG_BRD,
+            Package,
+            PackageLength);
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+
+        status = GoodixSendFlashCmd(DeviceContext, FwType, PackageLength, FlashAddress);
+        if (status != STATUS_RETRY) {
+            return status;
+        }
+    }
+
+    return STATUS_RETRY;
+}
+
+static
+NTSTATUS
+GoodixFlashSubsystem(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _In_ const GOODIX_FW_SUBSYS* Subsystem
+    )
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    UINT8* packet;
+    ULONG offset = 0;
+    ULONG remaining = Subsystem->Size;
+
+    packet = (UINT8*)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        GOODIX_FW_PACKET_MAX_SIZE + 4,
+        TOUCH_POOL_TAG);
+    if (packet == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    while (remaining > 0) {
+        ULONG chunk = (remaining > GOODIX_FW_PACKET_MAX_SIZE) ? GOODIX_FW_PACKET_MAX_SIZE : remaining;
+
+        RtlCopyMemory(packet, Subsystem->Data + offset, chunk);
+        GoodixAppendChecksumU16Le(packet, chunk);
+
+        status = GoodixFlashPackage(
+            DeviceContext,
+            Subsystem->Type,
+            packet,
+            Subsystem->FlashAddress + offset,
+            (UINT16)(chunk + 4));
+        if (!NT_SUCCESS(status)) {
+            break;
+        }
+
+        offset += chunk;
+        remaining -= chunk;
+    }
+
+    ExFreePoolWithTag(packet, TOUCH_POOL_TAG);
+    return status;
+}
+
+static
+NTSTATUS
+GoodixFlashFirmware(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _In_ const GOODIX_PARSED_FW* ParsedFirmware
+    )
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG i;
+
+    for (i = 1; i < ParsedFirmware->SubsysNum; i++) {
+        status = GoodixFlashSubsystem(DeviceContext, &ParsedFirmware->Subsys[i]);
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static
+NTSTATUS
+GoodixMaybeUpdateFirmware(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _Inout_ PGOODIX_FW_VERSION Version
+    )
+{
+    GOODIX_PARSED_FW parsedFirmware;
+    NTSTATUS status;
+    ULONG attempt;
+
+    if (DeviceContext->ResetGpioIoTarget == WDF_NO_HANDLE) {
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    status = GoodixParseEmbeddedFirmware(&parsedFirmware);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    if (!GoodixFirmwareNeedsUpdate(Version, &parsedFirmware)) {
+        return STATUS_SUCCESS;
+    }
+
+#ifdef DEBUG
+    TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "Goodix firmware update needed current_pid=%c%c%c%c%c%c%c%c current_vid=%02X%02X%02X%02X target_pid=%c%c%c%c%c%c%c%c target_vid=%02X%02X%02X%02X",
+        Version->PatchPid[0], Version->PatchPid[1], Version->PatchPid[2], Version->PatchPid[3],
+        Version->PatchPid[4], Version->PatchPid[5], Version->PatchPid[6], Version->PatchPid[7],
+        Version->PatchVid[0], Version->PatchVid[1], Version->PatchVid[2], Version->PatchVid[3],
+        parsedFirmware.FwPid[0], parsedFirmware.FwPid[1], parsedFirmware.FwPid[2], parsedFirmware.FwPid[3],
+        parsedFirmware.FwPid[4], parsedFirmware.FwPid[5], parsedFirmware.FwPid[6], parsedFirmware.FwPid[7],
+        parsedFirmware.FwVid[0], parsedFirmware.FwVid[1], parsedFirmware.FwVid[2], parsedFirmware.FwVid[3]);
+#endif
+
+    for (attempt = 0; attempt < 2; attempt++) {
+        status = GoodixUpdatePrepare(DeviceContext, &parsedFirmware);
+        if (!NT_SUCCESS(status)) {
+            continue;
+        }
+
+        status = GoodixFlashFirmware(DeviceContext, &parsedFirmware);
+        if (NT_SUCCESS(status)) {
+            break;
+        }
+    }
+
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = GoodixResetDevice(DeviceContext, 100);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = GoodixReadVersion(DeviceContext, Version);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    if (RtlCompareMemory(Version->PatchPid, parsedFirmware.FwPid, sizeof(parsedFirmware.FwPid)) != sizeof(parsedFirmware.FwPid) ||
+        RtlCompareMemory(Version->PatchVid, parsedFirmware.FwVid, sizeof(parsedFirmware.FwVid)) != sizeof(parsedFirmware.FwVid)) {
+        return STATUS_REVISION_MISMATCH;
+    }
+
+    DeviceContext->FirmwareUpdated = TRUE;
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS
