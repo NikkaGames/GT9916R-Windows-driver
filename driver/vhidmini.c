@@ -18,13 +18,8 @@ Environment:
 #include "vhidmini.h"
 #include "goodix_9916r_blobs.h"
 #include "goodix_9916r_firmware.h"
-
-#define DEBUG
-
-#ifdef DEBUG
 #include "kmdf/trace.h"
 #include "vhidmini.tmh"
-#endif
 
 #define EVT_ID_NOEVENT						0x00	/*No Events*/
 #define EVT_ID_CONTROLLER_READY				0x03	/*Controller ready, issued after a system reset.*/
@@ -951,33 +946,23 @@ Return Value:
     WDF_DRIVER_CONFIG       config;
     WDF_OBJECT_ATTRIBUTES driverAttributes;
     NTSTATUS                status;
-#ifdef DEBUG
     WPP_INIT_TRACING(DriverObject, RegistryPath);
-#endif
-#ifdef DEBUG
     TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "George Droid on command. :D");
-#endif
 #ifdef _KERNEL_MODE
     //
     // Opt-in to using non-executable pool memory on Windows 8 and later.
     // https://msdn.microsoft.com/en-us/library/windows/hardware/hh920402(v=vs.85).aspx
     //
     ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
-#ifdef DEBUG
     TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "Kernel Mode.");
-#endif
 #endif
 
     WDF_DRIVER_CONFIG_INIT(&config, EvtDeviceAdd);
 
-#ifdef DEBUG
     TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "Driver Init.");
-#endif
 
     WDF_OBJECT_ATTRIBUTES_INIT(&driverAttributes);
-#ifdef DEBUG
     TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "Attributes Init.");
-#endif
     driverAttributes.EvtCleanupCallback = EvtDriverCleanup;
 
     status = WdfDriverCreate(DriverObject,
@@ -997,11 +982,7 @@ EvtDriverCleanup(
     _In_ WDFOBJECT Object
 )
 {
-#ifdef DEBUG
     WPP_CLEANUP(WdfDriverWdmGetDriverObject((WDFDRIVER)Object));
-#else
-    UNREFERENCED_PARAMETER(Object);
-#endif
 }
 
 NTSTATUS
@@ -1427,9 +1408,7 @@ OnD0Entry(
     if (pDevice->ResetGpioPresent) {
         status = GoodixOpenResetGpio(pDevice);
         if (!NT_SUCCESS(status)) {
-#ifdef DEBUG
             TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "GoodixOpenResetGpio failed status=0x%08X", status);
-#endif
             status = STATUS_SUCCESS;
         }
     }
@@ -1442,7 +1421,6 @@ OnD0Entry(
     if (NT_SUCCESS(status)) {
         pDevice->SensorId = version.SensorId;
         pDevice->VersionValid = TRUE;
-#ifdef DEBUG
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "Goodix version read ok sensor_id=%u pid=%c%c%c%c%c%c%c%c",
             version.SensorId,
             version.PatchPid[0], version.PatchPid[1], version.PatchPid[2], version.PatchPid[3],
@@ -1452,11 +1430,8 @@ OnD0Entry(
             g_GoodixEmbeddedFwPid[3], g_GoodixEmbeddedFwPid[4],
             g_GoodixEmbeddedFwVid[0], g_GoodixEmbeddedFwVid[1], g_GoodixEmbeddedFwVid[2], g_GoodixEmbeddedFwVid[3],
             version.PatchVid[0], version.PatchVid[1], version.PatchVid[2], version.PatchVid[3]);
-#endif
     } else {
-#ifdef DEBUG
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "GoodixReadVersion failed status=0x%08X", status);
-#endif
     }
 
     if (pDevice->VersionValid) {
@@ -1465,36 +1440,28 @@ OnD0Entry(
             pDevice->SensorId = version.SensorId;
             pDevice->VersionValid = TRUE;
         } else {
-#ifdef DEBUG
             TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "GoodixMaybeUpdateFirmware failed status=0x%08X", status);
-#endif
             status = STATUS_SUCCESS;
         }
     }
 
     status = GoodixReadIcInfo(pDevice);
     if (!NT_SUCCESS(status)) {
-#ifdef DEBUG
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "GoodixReadIcInfo failed status=0x%08X, keeping defaults", status);
-#endif
         status = STATUS_SUCCESS;
     }
 
     status = GoodixApplyEmbeddedConfig(pDevice);
     if (!NT_SUCCESS(status)) {
-#ifdef DEBUG
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "GoodixApplyEmbeddedConfig failed sensor_id=%u status=0x%08X",
             pDevice->SensorId, status);
-#endif
         status = STATUS_SUCCESS;
     }
 
     status = GoodixApplyReportRate(pDevice, pDevice->ReportRateLevel);
     if (!NT_SUCCESS(status)) {
-#ifdef DEBUG
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "GoodixApplyReportRate failed level=%u status=0x%08X",
             pDevice->ReportRateLevel, status);
-#endif
         status = STATUS_SUCCESS;
     }
 
@@ -2717,15 +2684,11 @@ OnInterruptIsr(
 
     if (touch_count > 10) // The touchscreen doesn't support more than 10 points.
     {
-#ifdef DEBUG
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "The touchscreen does not support more than 10 points. Defaulting to 10.");
-#endif
         touch_count = 10;
     }
     else if (touch_count > 0) {
-#ifdef DEBUG
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "Touch Point(s): %d.", touch_count);
-#endif
     }
 
     if (touch_count > 0) {
@@ -2746,9 +2709,7 @@ OnInterruptIsr(
             readReport.points[0] = 0x06;
             readReport.points[1] = pDevice->LastTouchID;
             readReport.DIG_TouchScreenContactCount = 1;
-#ifdef DEBUG
             TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "Point Leave X:%d, Y:%d", x, y);
-#endif
             break;
         }
         default: {
@@ -2763,10 +2724,8 @@ OnInterruptIsr(
                 readReport.points[i * 6 + 3] = (x >> 8) & 0x0F;
                 readReport.points[i * 6 + 4] = y & 0xFF;
                 readReport.points[i * 6 + 5] = (y >> 8) & 0x0F;
-#ifdef DEBUG
                 TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "Touch %d X:%d, Y:%d", touchId + 1, x, y);
                 TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "Touch %d Buffer %x %x %x %x %x %x %x %x", touchId + 1, touchBuf[0 + i * 8], touchBuf[1 + i * 8], touchBuf[2 + i * 8], touchBuf[3 + i * 8], touchBuf[4 + i * 8], touchBuf[5 + i * 8], touchBuf[6 + i * 8], touchBuf[7 + i * 8]);
-#endif
             }
         }
     }
@@ -3428,7 +3387,6 @@ GoodixMaybeUpdateFirmware(
         return STATUS_SUCCESS;
     }
 
-#ifdef DEBUG
     TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "Goodix firmware update needed current_pid=%c%c%c%c%c%c%c%c current_vid=%02X%02X%02X%02X target_pid=%c%c%c%c%c%c%c%c target_vid=%02X%02X%02X%02X",
         Version->PatchPid[0], Version->PatchPid[1], Version->PatchPid[2], Version->PatchPid[3],
         Version->PatchPid[4], Version->PatchPid[5], Version->PatchPid[6], Version->PatchPid[7],
@@ -3436,7 +3394,6 @@ GoodixMaybeUpdateFirmware(
         parsedFirmware.FwPid[0], parsedFirmware.FwPid[1], parsedFirmware.FwPid[2], parsedFirmware.FwPid[3],
         parsedFirmware.FwPid[4], parsedFirmware.FwPid[5], parsedFirmware.FwPid[6], parsedFirmware.FwPid[7],
         parsedFirmware.FwVid[0], parsedFirmware.FwVid[1], parsedFirmware.FwVid[2], parsedFirmware.FwVid[3]);
-#endif
 
     for (attempt = 0; attempt < 2; attempt++) {
         status = GoodixUpdatePrepare(DeviceContext, &parsedFirmware);
@@ -3606,9 +3563,7 @@ SpbDeviceWriteRead(
     );
 
     if (!NT_SUCCESS(status)) {
-#ifdef DEBUG
-        Trace(TRACE_LEVEL_ERROR, TRACE_DEVICE, "Failed to send IOCTL, NTSTATUS=0x%08lX", status);
-#endif
+        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE, "Failed to send IOCTL, NTSTATUS=0x%08lX", status);
     }
 
     return status;
@@ -3764,14 +3719,12 @@ GoodixReadIcInfo(
             pDevice->FwBufferMaxLength = misc.FwBufferMaxLength;
             pDevice->IcInfoValid = TRUE;
 
-#ifdef DEBUG
             TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
                 "Goodix ic_info ok cmd=0x%08X touch=0x%08X fwbuf=0x%08X fwbuflen=%u",
                 pDevice->CommandAddress,
                 pDevice->TouchDataAddress,
                 pDevice->FwBufferAddress,
                 pDevice->FwBufferMaxLength);
-#endif
             status = STATUS_SUCCESS;
             break;
         }
@@ -3819,7 +3772,6 @@ GoodixApplyEmbeddedConfig(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-#ifdef DEBUG
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
         "Applying embedded cfg sensor_id=%u selected_sensor_id=%u len=%u fw_pid=%c%c%c%c%c",
         pDevice->SensorId,
@@ -3827,7 +3779,6 @@ GoodixApplyEmbeddedConfig(
         packageInfo.ConfigLength,
         g_GoodixEmbeddedFwPid[0], g_GoodixEmbeddedFwPid[1], g_GoodixEmbeddedFwPid[2],
         g_GoodixEmbeddedFwPid[3], g_GoodixEmbeddedFwPid[4]);
-#endif
 
     status = GoodixSendConfigCommand(pDevice, GOODIX_CFG_CMD_START);
     if (!NT_SUCCESS(status)) {
