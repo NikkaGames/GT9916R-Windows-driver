@@ -102,6 +102,7 @@ static NTSTATUS GoodixResetDevice(_In_ PDEVICE_CONTEXT DeviceContext, _In_ ULONG
 static NTSTATUS GoodixParseEmbeddedFirmware(_Out_ PGOODIX_PARSED_FW ParsedFirmware);
 static NTSTATUS GoodixMaybeUpdateFirmware(_In_ PDEVICE_CONTEXT DeviceContext, _Inout_ PGOODIX_FW_VERSION Version);
 static VOID GoodixHandleControllerRequest(_In_ PDEVICE_CONTEXT DeviceContext, _In_ UINT8 RequestCode);
+static VOID GoodixPollPendingControllerEvent(_In_ PDEVICE_CONTEXT DeviceContext, _In_ ULONG RetryCount, _In_ ULONG DelayMs);
 
 typedef struct _GOODIX_CFG_PACKAGE_INFO {
     const UINT8* ConfigData;
@@ -1472,6 +1473,10 @@ OnD0Entry(
         WdfInterruptEnable(pDevice->Interrupt);
     }
 
+    if (!pDevice->ConfigApplied) {
+        GoodixPollPendingControllerEvent(pDevice, 20, 20);
+    }
+
     return status;
 }
 
@@ -1519,6 +1524,52 @@ GoodixHandleControllerRequest(
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
             "Goodix request: unsupported code=0x%02X", RequestCode);
         break;
+    }
+}
+
+static
+VOID
+GoodixPollPendingControllerEvent(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _In_ ULONG RetryCount,
+    _In_ ULONG DelayMs
+    )
+{
+    ULONG retry;
+    UINT8 infoBuf[3] = { 0 };
+    UINT8 touchEvtClear = 0;
+    NTSTATUS status;
+
+    for (retry = 0; retry < RetryCount; retry++) {
+        status = GoodixRead(DeviceContext, DeviceContext->TouchDataAddress, infoBuf, sizeof(infoBuf));
+        if (!NT_SUCCESS(status)) {
+            return;
+        }
+
+        if ((infoBuf[0] & GOODIX_REQUEST_EVENT) != 0) {
+            TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
+                "Goodix pending request event status=0x%02X code=0x%02X",
+                infoBuf[0], infoBuf[2]);
+            GoodixHandleControllerRequest(DeviceContext, infoBuf[2]);
+            GoodixWrite(DeviceContext, DeviceContext->TouchDataAddress, &touchEvtClear, 1);
+            return;
+        }
+
+        if (infoBuf[0] == EVT_ID_CONTROLLER_READY) {
+            TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
+                "Goodix pending controller ready event");
+            GoodixHandleControllerRequest(DeviceContext, 0x01);
+            GoodixWrite(DeviceContext, DeviceContext->TouchDataAddress, &touchEvtClear, 1);
+            return;
+        }
+
+        if ((infoBuf[0] & GOODIX_TOUCH_EVENT) != 0 || infoBuf[0] != 0x00) {
+            return;
+        }
+
+        if (DelayMs != 0) {
+            GoodixDelayMilliseconds((LONG)DelayMs);
+        }
     }
 }
 
@@ -2717,23 +2768,21 @@ OnInterruptIsr(
     }
 
     // touchBuf[0] EventID
-    switch (infoBuf[0])
-    {
-    case GOODIX_TOUCH_EVENT:
-        break;
-    case GOODIX_REQUEST_EVENT:
+    if ((infoBuf[0] & GOODIX_TOUCH_EVENT) != 0) {
+        // Continue into touch processing below.
+    } else if ((infoBuf[0] & GOODIX_REQUEST_EVENT) != 0) {
         GoodixHandleControllerRequest(pDevice, infoBuf[2]);
         goto exit;
-    case GOODIX_GESTURE_EVENT:
-    case GOODIX_HOTKNOT_EVENT:
-    case EVT_ID_CONTROLLER_READY:
+    } else if (infoBuf[0] == EVT_ID_CONTROLLER_READY) {
         if (!pDevice->ConfigApplied) {
             TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
                 "Goodix controller ready, applying deferred config");
             GoodixHandleControllerRequest(pDevice, 0x01);
         }
         goto exit;
-    default:
+    } else if ((infoBuf[0] & (GOODIX_GESTURE_EVENT | GOODIX_HOTKNOT_EVENT)) != 0) {
+        goto exit;
+    } else {
         goto exit;
     }
 
