@@ -191,6 +191,15 @@
       <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories);..\..\inc;..</AdditionalIncludeDirectories>
       <ExceptionHandling>
       </ExceptionHandling>
+      <WppEnabled>true</WppEnabled>
+      <WppTraceFunction>
+      </WppTraceFunction>
+      <WppScanConfigurationData>trace.h</WppScanConfigurationData>
+      <StructMemberAlignment>8Bytes</StructMemberAlignment>
+      <WppRecorderEnabled>true</WppRecorderEnabled>
+      <WppAdditionalIncludeDirectories>
+      </WppAdditionalIncludeDirectories>
+      <WppMinimalRebuildFromTracking>false</WppMinimalRebuildFromTracking>
     </ClCompile>
     <Midl>
       <PreprocessorDefinitions>%(PreprocessorDefinitions);_UNICODE;UNICODE;POOL_NX_OPTIN=1</PreprocessorDefinitions>
@@ -253,13 +262,13 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="..\vhidmini.c">
-      <WppEnabled Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">true</WppEnabled>
+      <WppEnabled Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64' or '$(Configuration)|$(Platform)'=='Release|ARM64'">true</WppEnabled>
       <WppScanConfigurationData Condition="'%(ClCompile.ScanConfigurationData)' == ''">trace.h</WppScanConfigurationData>
-      <WppTraceFunction Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">Trace(LEVEL,FLAGS,MSG,...)</WppTraceFunction>
+      <WppTraceFunction Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64' or '$(Configuration)|$(Platform)'=='Release|ARM64'">Trace(LEVEL,FLAGS,MSG,...)</WppTraceFunction>
     </ClCompile>
     <ClCompile Include="util.c">
-      <WppEnabled Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">true</WppEnabled>
-      <WppTraceFunction Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">Trace(LEVEL,FLAGS,MSG,...)</WppTraceFunction>
+      <WppEnabled Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64' or '$(Configuration)|$(Platform)'=='Release|ARM64'">true</WppEnabled>
+      <WppTraceFunction Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64' or '$(Configuration)|$(Platform)'=='Release|ARM64'">Trace(LEVEL,FLAGS,MSG,...)</WppTraceFunction>
       <WppScanConfigurationData Condition="'%(ClCompile.ScanConfigurationData)' == ''">trace.h</WppScanConfigurationData>
     </ClCompile>
     <ResourceCompile Include="vhidmini.rc" />

@@ -41,9 +41,56 @@ Environment:
 #define GOODIX_SPI_READ         0xF1
 #define GOODIX_SPI_WRITE        0xF0
 #define ISP_RAM_ADDR			0x18400
+#define GOODIX_FW_VERSION_ADDR  0x10014
+#define GOODIX_IC_INFO_ADDR     0x10070
 #define TOUCH_INFO_ADDR         0x10308
 #define CMD_ADDR                0x10180
 #define TOUCH_POOL_TAG          (ULONG)'dooG'
+
+#define GOODIX_REPORT_RATE_120HZ 0
+#define GOODIX_REPORT_RATE_240HZ 1
+#define GOODIX_REPORT_RATE_360HZ 2
+#define GOODIX_REPORT_RATE_480HZ 3
+#define GOODIX_REPORT_RATE_960HZ 4
+
+#define GOODIX_CMD_ACK_BUSY             0x02
+#define GOODIX_CMD_ACK_BUFFER_OVERFLOW  0x03
+#define GOODIX_CMD_ACK_CHECKSUM_ERROR   0x04
+#define GOODIX_CMD_ACK_OK               0x80
+#define GOODIX_CMD_RETRY                6
+
+#define GOODIX_CMD_MAX_DATA_LEN         10
+#define GOODIX_CMD_MAX_BUF_LEN          16
+
+typedef struct _GOODIX_FW_VERSION {
+    UINT8 RomPid[6];
+    UINT8 RomVid[3];
+    UINT8 RomVidReserved;
+    UINT8 PatchPid[8];
+    UINT8 PatchVid[4];
+    UINT8 PatchVidReserved;
+    UINT8 SensorId;
+    UINT8 Reserved[2];
+    UINT16 Checksum;
+} GOODIX_FW_VERSION, *PGOODIX_FW_VERSION;
+
+#pragma warning(push)
+#pragma warning(disable:4201)
+#pragma pack(push, 1)
+typedef struct _GOODIX_CMD_PACKET {
+    union {
+        struct {
+            UINT8 State;
+            UINT8 Ack;
+            UINT8 Length;
+            UINT8 Command;
+            UINT8 Data[GOODIX_CMD_MAX_DATA_LEN];
+        };
+        UINT8 Buffer[GOODIX_CMD_MAX_BUF_LEN];
+    };
+} GOODIX_CMD_PACKET, *PGOODIX_CMD_PACKET;
+#pragma pack(pop)
+#pragma warning(pop)
 
 typedef UCHAR HID_REPORT_DESCRIPTOR, *PHID_REPORT_DESCRIPTOR;
 
@@ -71,8 +118,15 @@ typedef struct _DEVICE_CONTEXT
     LARGE_INTEGER           PeripheralId;
     WDFINTERRUPT            Interrupt;
     WDFIOTARGET             SpbController;
+    WDFWAITLOCK             IoLock;
     BOOLEAN                 OnClose;
     UINT8                   LastTouchID;
+    UINT8                   ReportRateLevel;
+    UINT8                   ActiveReportRateLevel;
+    UINT8                   SensorId;
+    BOOLEAN                 VersionValid;
+    ULONG                   TouchDataAddress;
+    ULONG                   CommandAddress;
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetDeviceContext);
@@ -190,7 +244,7 @@ OnInterruptIsr(
     _In_  ULONG        MessageID
 );
 
-VOID
+NTSTATUS
 SpbDeviceOpen(
     _In_  PDEVICE_CONTEXT  pDevice
 );
@@ -199,14 +253,14 @@ SpbDeviceClose(
     _In_  PDEVICE_CONTEXT  pDevice
 );
 
-VOID
+NTSTATUS
 SpbDeviceWrite(
     _In_ PDEVICE_CONTEXT pDevice,
     _In_ PVOID pInputBuffer,
     _In_ size_t inputBufferLength
 );
 
-VOID
+NTSTATUS
 SpbDeviceWriteRead(
     _In_ PDEVICE_CONTEXT pDevice,
     _In_ PVOID pInputBuffer,
@@ -215,7 +269,7 @@ SpbDeviceWriteRead(
     _In_ size_t outputBufferLength
 );
 
-VOID
+NTSTATUS
 GoodixRead(
     _In_ PDEVICE_CONTEXT pDevice,
     _In_ UINT32 addr,
@@ -223,13 +277,25 @@ GoodixRead(
     _In_ UINT32 readLen
 );
 
-VOID
+NTSTATUS
 GoodixWrite(
     _In_ PDEVICE_CONTEXT pDevice,
     _In_ UINT32 addr,
     _In_ UINT8* writeBuf,
     _In_ UINT32 writeLen
 );
+
+NTSTATUS
+GoodixReadVersion(
+    _In_ PDEVICE_CONTEXT pDevice,
+    _Out_ PGOODIX_FW_VERSION Version
+    );
+
+NTSTATUS
+GoodixApplyReportRate(
+    _In_ PDEVICE_CONTEXT pDevice,
+    _In_ UINT8 ReportRateLevel
+    );
 
 NTSTATUS
 ReadDescriptorFromRegistry(

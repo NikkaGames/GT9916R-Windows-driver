@@ -29,6 +29,7 @@ Environment:
 #define  HIDMINI_CONTROL_CODE_SET_ATTRIBUTES              0x00
 #define  HIDMINI_CONTROL_CODE_DUMMY1                      0x01
 #define  HIDMINI_CONTROL_CODE_DUMMY2                      0x02
+#define  HIDMINI_CONTROL_CODE_SET_REPORT_RATE             0x03
 
 //
 // This is the report id of the collection to which the control codes are sent
@@ -53,6 +54,13 @@ typedef struct _MY_DEVICE_ATTRIBUTES {
 
 } MY_DEVICE_ATTRIBUTES, *PMY_DEVICE_ATTRIBUTES;
 
+typedef struct _GOODIX_REPORT_RATE_CONTROL {
+
+    ULONG Level;
+    ULONG Reserved;
+
+} GOODIX_REPORT_RATE_CONTROL, *PGOODIX_REPORT_RATE_CONTROL;
+
 typedef struct _HIDMINI_CONTROL_INFO {
 
     //
@@ -71,6 +79,7 @@ typedef struct _HIDMINI_CONTROL_INFO {
     //
     union {
         MY_DEVICE_ATTRIBUTES Attributes;
+        GOODIX_REPORT_RATE_CONTROL ReportRate;
         struct {
             ULONG Dummy1;
             ULONG Dummy2;

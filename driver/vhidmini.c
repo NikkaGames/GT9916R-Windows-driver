@@ -47,6 +47,132 @@ ULONG XMax = 1080;
 ULONG YMin = 0;
 ULONG YMax = 2400;
 
+static
+VOID
+GoodixDelayMilliseconds(
+    _In_ LONG Milliseconds
+    )
+{
+    LARGE_INTEGER interval;
+
+    interval.QuadPart = -(10 * 1000 * Milliseconds);
+    KeDelayExecutionThread(KernelMode, FALSE, &interval);
+}
+
+static
+VOID
+GoodixAppendChecksumU8Le(
+    _Inout_updates_bytes_(Length + 2) PUINT8 Data,
+    _In_ ULONG Length
+    )
+{
+    ULONG checksum = 0;
+    ULONG i;
+
+    for (i = 0; i < Length; i++) {
+        checksum += Data[i];
+    }
+
+    Data[Length] = (UINT8)(checksum & 0xFF);
+    Data[Length + 1] = (UINT8)((checksum >> 8) & 0xFF);
+}
+
+static
+BOOLEAN
+GoodixChecksumValidU8Le(
+    _In_reads_bytes_(Length) const UINT8* Data,
+    _In_ ULONG Length
+    )
+{
+    ULONG checksum = 0;
+    ULONG i;
+
+    if (Length < 2) {
+        return FALSE;
+    }
+
+    for (i = 0; i < Length - 2; i++) {
+        checksum += Data[i];
+    }
+
+    return (((UINT16)checksum) == ((UINT16)Data[Length - 2] | ((UINT16)Data[Length - 1] << 8)));
+}
+
+static
+UINT8
+GoodixNormalizeReportRateLevel(
+    _In_ UINT8 ReportRateLevel
+    )
+{
+    switch (ReportRateLevel) {
+    case GOODIX_REPORT_RATE_120HZ:
+    case GOODIX_REPORT_RATE_240HZ:
+    case GOODIX_REPORT_RATE_480HZ:
+    case GOODIX_REPORT_RATE_960HZ:
+        return ReportRateLevel;
+    case GOODIX_REPORT_RATE_360HZ:
+    default:
+        return GOODIX_REPORT_RATE_240HZ;
+    }
+}
+
+static
+NTSTATUS
+GoodixSendCommand(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _Inout_ PGOODIX_CMD_PACKET Command
+    )
+{
+    GOODIX_CMD_PACKET ack = { 0 };
+    NTSTATUS status = STATUS_IO_TIMEOUT;
+    ULONG retry;
+    ULONG poll;
+
+    WdfWaitLockAcquire(DeviceContext->IoLock, NULL);
+
+    Command->State = 0;
+    Command->Ack = 0;
+    GoodixAppendChecksumU8Le(&Command->Buffer[2], Command->Length - 2);
+
+    for (retry = 0; retry < GOODIX_CMD_RETRY; retry++) {
+        status = GoodixWrite(DeviceContext, DeviceContext->CommandAddress, Command->Buffer, sizeof(*Command));
+        if (!NT_SUCCESS(status)) {
+            break;
+        }
+
+        for (poll = 0; poll < GOODIX_CMD_RETRY; poll++) {
+            status = GoodixRead(DeviceContext, DeviceContext->CommandAddress, ack.Buffer, sizeof(ack));
+            if (!NT_SUCCESS(status)) {
+                break;
+            }
+
+            if (ack.Ack == GOODIX_CMD_ACK_OK) {
+                GoodixDelayMilliseconds(40);
+                status = STATUS_SUCCESS;
+                goto Exit;
+            }
+
+            if (ack.Ack == GOODIX_CMD_ACK_BUSY || ack.Ack == 0x00) {
+                GoodixDelayMilliseconds(1);
+                continue;
+            }
+
+            if (ack.Ack == GOODIX_CMD_ACK_BUFFER_OVERFLOW) {
+                GoodixDelayMilliseconds(10);
+            } else if (ack.Ack == GOODIX_CMD_ACK_CHECKSUM_ERROR) {
+                status = STATUS_CRC_ERROR;
+            } else {
+                status = STATUS_INVALID_DEVICE_STATE;
+            }
+            break;
+        }
+    }
+
+Exit:
+    WdfWaitLockRelease(DeviceContext->IoLock);
+    return status;
+}
+
 
 typedef struct
 {
@@ -559,6 +685,17 @@ Return Value:
     deviceContext->Device       = device;
     deviceContext->DeviceData = 0;
     deviceContext->OnClose = FALSE;
+    deviceContext->ReportRateLevel = GOODIX_REPORT_RATE_240HZ;
+    deviceContext->ActiveReportRateLevel = 0xFF;
+    deviceContext->SensorId = 0;
+    deviceContext->VersionValid = FALSE;
+    deviceContext->TouchDataAddress = TOUCH_INFO_ADDR;
+    deviceContext->CommandAddress = CMD_ADDR;
+
+    status = WdfWaitLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &deviceContext->IoLock);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
 
     hidAttributes = &deviceContext->HidDeviceAttributes;
     RtlZeroMemory(hidAttributes, sizeof(HID_DEVICE_ATTRIBUTES));
@@ -854,6 +991,7 @@ OnD0Entry(
 
     PDEVICE_CONTEXT pDevice = GetDeviceContext(FxDevice);
     NTSTATUS status;
+    GOODIX_FW_VERSION version = { 0 };
 
     //
     // Create the SPB target.
@@ -871,7 +1009,40 @@ OnD0Entry(
     {
     }
 
-    SpbDeviceOpen(pDevice);
+    status = SpbDeviceOpen(pDevice);
+    if (!NT_SUCCESS(status)) {
+        if (pDevice->SpbController != WDF_NO_HANDLE)
+        {
+            WdfObjectDelete(pDevice->SpbController);
+            pDevice->SpbController = WDF_NO_HANDLE;
+        }
+        return status;
+    }
+
+    status = GoodixReadVersion(pDevice, &version);
+    if (NT_SUCCESS(status)) {
+        pDevice->SensorId = version.SensorId;
+        pDevice->VersionValid = TRUE;
+#ifdef DEBUG
+        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "Goodix version read ok sensor_id=%u pid=%c%c%c%c%c%c%c%c",
+            version.SensorId,
+            version.PatchPid[0], version.PatchPid[1], version.PatchPid[2], version.PatchPid[3],
+            version.PatchPid[4], version.PatchPid[5], version.PatchPid[6], version.PatchPid[7]);
+#endif
+    } else {
+#ifdef DEBUG
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "GoodixReadVersion failed status=0x%08X", status);
+#endif
+    }
+
+    status = GoodixApplyReportRate(pDevice, pDevice->ReportRateLevel);
+    if (!NT_SUCCESS(status)) {
+#ifdef DEBUG
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "GoodixApplyReportRate failed level=%u status=0x%08X",
+            pDevice->ReportRateLevel, status);
+#endif
+        status = STATUS_SUCCESS;
+    }
 
     return status;
 }
@@ -1531,6 +1702,17 @@ Return Value:
         
         break;
 
+    case HIDMINI_CONTROL_CODE_SET_REPORT_RATE:
+        QueueContext->DeviceContext->ReportRateLevel =
+            GoodixNormalizeReportRateLevel((UINT8)controlInfo->u.ReportRate.Level);
+        status = GoodixApplyReportRate(
+            QueueContext->DeviceContext,
+            QueueContext->DeviceContext->ReportRateLevel);
+        if (NT_SUCCESS(status)) {
+            WdfRequestSetInformation(Request, reportSize);
+        }
+        break;
+
     default:
         status = STATUS_NOT_IMPLEMENTED;
         break;
@@ -2053,7 +2235,10 @@ OnInterruptIsr(
     RtlZeroMemory(touchBuf, sizeof(touchBuf));
     RtlZeroMemory(infoBuf, sizeof(infoBuf));
 
-    GoodixRead(pDevice, TOUCH_INFO_ADDR, infoBuf, sizeof(infoBuf));
+    status = GoodixRead(pDevice, pDevice->TouchDataAddress, infoBuf, sizeof(infoBuf));
+    if (!NT_SUCCESS(status)) {
+        goto exit;
+    }
 
     // touchBuf[0] EventID
     switch (infoBuf[0])
@@ -2084,7 +2269,16 @@ OnInterruptIsr(
 #endif
     }
 
-    GoodixRead(pDevice, TOUCH_INFO_ADDR + 8, touchBuf, 10 + BYTES_PER_COORD * (touch_count - 1));
+    if (touch_count > 0) {
+        status = GoodixRead(
+            pDevice,
+            pDevice->TouchDataAddress + 8,
+            touchBuf,
+            10 + BYTES_PER_COORD * (touch_count - 1));
+        if (!NT_SUCCESS(status)) {
+            goto exit;
+        }
+    }
 
     switch(touch_count)
     {
@@ -2134,11 +2328,11 @@ OnInterruptIsr(
     }
 
 exit:
-    GoodixWrite(pDevice, TOUCH_INFO_ADDR, &touchEvtClear, 1);
+    GoodixWrite(pDevice, pDevice->TouchDataAddress, &touchEvtClear, 1);
     return fInterruptRecognized;
 }
 
-VOID
+NTSTATUS
 GoodixRead(
     _In_ PDEVICE_CONTEXT pDevice,
     _In_ UINT32 addr,
@@ -2146,6 +2340,7 @@ GoodixRead(
     _In_ UINT32 readLen
 )
 {
+    NTSTATUS status = STATUS_SUCCESS;
     PUINT8 TxBuf = (PUINT8)ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
         8 + readLen,
@@ -2157,6 +2352,11 @@ GoodixRead(
         TOUCH_POOL_TAG
     );
 
+    if (TxBuf == NULL || RxBuf == NULL) {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Exit;
+    }
+
     TxBuf[0] = GOODIX_SPI_READ;
     TxBuf[1] = (addr >> 24) & 0xFF;
     TxBuf[2] = (addr >> 16) & 0xFF;
@@ -2166,15 +2366,18 @@ GoodixRead(
     TxBuf[6] = 0xFF;
     TxBuf[7] = 0xFF;
 
-    SpbDeviceWriteRead(pDevice, TxBuf, RxBuf, 8 + readLen, 8 + readLen);
+    status = SpbDeviceWriteRead(pDevice, TxBuf, RxBuf, 8 + readLen, 8 + readLen);
+    if (NT_SUCCESS(status)) {
+        RtlCopyMemory(readBuf, &RxBuf[8], readLen);
+    }
 
-    RtlCopyMemory(readBuf, &RxBuf[8], readLen);
-
+Exit:
     ExFreePoolWithTag(TxBuf, TOUCH_POOL_TAG);
     ExFreePoolWithTag(RxBuf, TOUCH_POOL_TAG);
+    return status;
 }
 
-VOID
+NTSTATUS
 GoodixWrite(
     _In_ PDEVICE_CONTEXT pDevice, 
     _In_ UINT32 addr, 
@@ -2187,6 +2390,11 @@ GoodixWrite(
         writeLen + 5,
         TOUCH_POOL_TAG
     );
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (SpbBuf == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     SpbBuf[0] = GOODIX_SPI_WRITE;
     SpbBuf[1] = (addr >> 24) & 0xFF;
@@ -2195,12 +2403,13 @@ GoodixWrite(
     SpbBuf[4] = addr & 0xFF;
     RtlCopyMemory(&SpbBuf[5], writeBuf, writeLen);
 
-    SpbDeviceWrite(pDevice, SpbBuf, writeLen + 5);
+    status = SpbDeviceWrite(pDevice, SpbBuf, writeLen + 5);
 
     ExFreePoolWithTag(SpbBuf, TOUCH_POOL_TAG);
+    return status;
 }
 
-VOID 
+NTSTATUS
 SpbDeviceOpen(
     _In_  PDEVICE_CONTEXT  pDevice
 )
@@ -2232,10 +2441,16 @@ SpbDeviceOpen(
 
     if (!NT_SUCCESS(status))
     {
+        return status;
     }
 
+    pDevice->OnClose = FALSE;
+
     //enable interrupt
-    WdfInterruptEnable(pDevice->Interrupt);
+    if (pDevice->Interrupt != NULL) {
+        WdfInterruptEnable(pDevice->Interrupt);
+    }
+    return STATUS_SUCCESS;
 }
 
 VOID
@@ -2247,7 +2462,7 @@ SpbDeviceClose(
     WdfIoTargetClose(pDevice->SpbController);
 }
 
-VOID
+NTSTATUS
 SpbDeviceWrite(
     _In_ PDEVICE_CONTEXT pDevice,
     _In_ PVOID pInputBuffer,
@@ -2276,9 +2491,10 @@ SpbDeviceWrite(
     {
     }
 
+    return status;
 }
 
-VOID
+NTSTATUS
 SpbDeviceWriteRead(
     _In_ PDEVICE_CONTEXT pDevice,
     _In_ PVOID pInputBuffer,
@@ -2329,7 +2545,160 @@ SpbDeviceWriteRead(
 #ifdef DEBUG
         Trace(TRACE_LEVEL_ERROR, TRACE_DEVICE, "Failed to send IOCTL, NTSTATUS=0x%08lX", status);
 #endif
-    } 
+    }
+
+    return status;
+}
+
+NTSTATUS
+GoodixReadVersion(
+    _In_ PDEVICE_CONTEXT pDevice,
+    _Out_ PGOODIX_FW_VERSION Version
+    )
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    GOODIX_FW_VERSION version = { 0 };
+    UINT8 retry;
+
+    for (retry = 0; retry < 2; retry++) {
+        status = GoodixRead(pDevice, GOODIX_FW_VERSION_ADDR, (UINT8*)&version, sizeof(version));
+        if (NT_SUCCESS(status) && GoodixChecksumValidU8Le((const UINT8*)&version, sizeof(version))) {
+            *Version = version;
+            return STATUS_SUCCESS;
+        }
+        GoodixDelayMilliseconds(5);
+    }
+
+    return NT_SUCCESS(status) ? STATUS_CRC_ERROR : status;
+}
+
+NTSTATUS
+GoodixApplyReportRate(
+    _In_ PDEVICE_CONTEXT pDevice,
+    _In_ UINT8 ReportRateLevel
+    )
+{
+    GOODIX_CMD_PACKET cmd = { 0 };
+    NTSTATUS status = STATUS_SUCCESS;
+    UINT8 requestedLevel = GoodixNormalizeReportRateLevel(ReportRateLevel);
+
+    if (pDevice->ActiveReportRateLevel == requestedLevel) {
+        pDevice->ReportRateLevel = requestedLevel;
+        return STATUS_SUCCESS;
+    }
+
+    switch (requestedLevel) {
+    case GOODIX_REPORT_RATE_120HZ:
+        if (pDevice->ActiveReportRateLevel == GOODIX_REPORT_RATE_960HZ) {
+            status = GoodixApplyReportRate(pDevice, GOODIX_REPORT_RATE_480HZ);
+            if (!NT_SUCCESS(status)) {
+                return status;
+            }
+            pDevice->ActiveReportRateLevel = GOODIX_REPORT_RATE_480HZ;
+        }
+        if (pDevice->ActiveReportRateLevel == GOODIX_REPORT_RATE_480HZ) {
+            cmd.Length = 0x06;
+            cmd.Command = 0xC0;
+            cmd.Data[0] = 0x00;
+            cmd.Data[1] = 0x00;
+            cmd.Data[2] = 0xC6;
+            status = GoodixSendCommand(pDevice, &cmd);
+            if (!NT_SUCCESS(status)) {
+                return status;
+            }
+        }
+        RtlZeroMemory(&cmd, sizeof(cmd));
+        cmd.Length = 0x05;
+        cmd.Command = 0x9D;
+        cmd.Data[0] = 0x00;
+        cmd.Data[1] = 0xA2;
+        cmd.Data[2] = 0x00;
+        status = GoodixSendCommand(pDevice, &cmd);
+        break;
+
+    case GOODIX_REPORT_RATE_240HZ:
+        if (pDevice->ActiveReportRateLevel == GOODIX_REPORT_RATE_960HZ) {
+            status = GoodixApplyReportRate(pDevice, GOODIX_REPORT_RATE_480HZ);
+            if (!NT_SUCCESS(status)) {
+                return status;
+            }
+            pDevice->ActiveReportRateLevel = GOODIX_REPORT_RATE_480HZ;
+        }
+        if (pDevice->ActiveReportRateLevel == GOODIX_REPORT_RATE_480HZ) {
+            cmd.Length = 0x06;
+            cmd.Command = 0xC0;
+            cmd.Data[0] = 0x00;
+            cmd.Data[1] = 0x00;
+            cmd.Data[2] = 0xC6;
+            status = GoodixSendCommand(pDevice, &cmd);
+            if (!NT_SUCCESS(status)) {
+                return status;
+            }
+        }
+        RtlZeroMemory(&cmd, sizeof(cmd));
+        cmd.Length = 0x05;
+        cmd.Command = 0x9D;
+        cmd.Data[0] = 0x01;
+        cmd.Data[1] = 0xA3;
+        cmd.Data[2] = 0x00;
+        status = GoodixSendCommand(pDevice, &cmd);
+        break;
+
+    case GOODIX_REPORT_RATE_480HZ:
+        if (pDevice->ActiveReportRateLevel == GOODIX_REPORT_RATE_960HZ) {
+            cmd.Length = 0x06;
+            cmd.Command = 0xC1;
+            cmd.Data[0] = 0x00;
+            cmd.Data[1] = 0x00;
+            cmd.Data[2] = 0xC7;
+            status = GoodixSendCommand(pDevice, &cmd);
+            if (!NT_SUCCESS(status)) {
+                return status;
+            }
+        } else {
+            cmd.Length = 0x06;
+            cmd.Command = 0xC0;
+            cmd.Data[0] = 0x01;
+            cmd.Data[1] = 0x00;
+            cmd.Data[2] = 0xC7;
+            status = GoodixSendCommand(pDevice, &cmd);
+            if (!NT_SUCCESS(status)) {
+                return status;
+            }
+        }
+        break;
+
+    case GOODIX_REPORT_RATE_960HZ:
+        if (pDevice->ActiveReportRateLevel != GOODIX_REPORT_RATE_480HZ) {
+            cmd.Length = 0x06;
+            cmd.Command = 0xC0;
+            cmd.Data[0] = 0x01;
+            cmd.Data[1] = 0x00;
+            cmd.Data[2] = 0xC7;
+            status = GoodixSendCommand(pDevice, &cmd);
+            if (!NT_SUCCESS(status)) {
+                return status;
+            }
+        }
+        RtlZeroMemory(&cmd, sizeof(cmd));
+        cmd.Length = 0x06;
+        cmd.Command = 0xC1;
+        cmd.Data[0] = 0x01;
+        cmd.Data[1] = 0x00;
+        cmd.Data[2] = 0xC8;
+        status = GoodixSendCommand(pDevice, &cmd);
+        break;
+
+    default:
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    if (NT_SUCCESS(status)) {
+        pDevice->ReportRateLevel = requestedLevel;
+        pDevice->ActiveReportRateLevel = requestedLevel;
+    }
+
+    return status;
 }
 
 
@@ -2356,8 +2725,10 @@ Return Value:
     UNICODE_STRING  xMaxName;
     UNICODE_STRING  yMinName;
     UNICODE_STRING  yMaxName;
+    UNICODE_STRING  reportRateName;
     PDEVICE_CONTEXT deviceContext;
     WDF_OBJECT_ATTRIBUTES   attributes;
+    ULONG reportRateLevel = GOODIX_REPORT_RATE_240HZ;
 
     deviceContext = GetDeviceContext(Device);
 
@@ -2376,6 +2747,7 @@ Return Value:
         RtlInitUnicodeString(&xMaxName, L"XMax");
         RtlInitUnicodeString(&yMinName, L"YMin");
         RtlInitUnicodeString(&yMaxName, L"YMax");
+        RtlInitUnicodeString(&reportRateName, L"ReportRateLevel");
 
         WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
         attributes.ParentObject = Device;
@@ -2387,6 +2759,9 @@ Return Value:
         status = WdfRegistryQueryULong(hKey, &xMaxName, &XMax);
         status = WdfRegistryQueryULong(hKey, &yMinName, &YMin);
         status = WdfRegistryQueryULong(hKey, &yMaxName, &YMax);
+        if (NT_SUCCESS(WdfRegistryQueryULong(hKey, &reportRateName, &reportRateLevel))) {
+            deviceContext->ReportRateLevel = GoodixNormalizeReportRateLevel((UINT8)reportRateLevel);
+        }
 
         WdfRegistryClose(hKey);
     }
