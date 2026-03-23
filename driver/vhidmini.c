@@ -102,7 +102,6 @@ static NTSTATUS GoodixResetDevice(_In_ PDEVICE_CONTEXT DeviceContext, _In_ ULONG
 static NTSTATUS GoodixParseEmbeddedFirmware(_Out_ PGOODIX_PARSED_FW ParsedFirmware);
 static NTSTATUS GoodixMaybeUpdateFirmware(_In_ PDEVICE_CONTEXT DeviceContext, _Inout_ PGOODIX_FW_VERSION Version);
 static VOID GoodixHandleControllerRequest(_In_ PDEVICE_CONTEXT DeviceContext, _In_ UINT8 RequestCode);
-static VOID GoodixPollPendingControllerEvent(_In_ PDEVICE_CONTEXT DeviceContext, _In_ ULONG RetryCount, _In_ ULONG DelayMs);
 
 typedef struct _GOODIX_CFG_PACKAGE_INFO {
     const UINT8* ConfigData;
@@ -1424,10 +1423,6 @@ OnD0Entry(
         }
     }
 
-    if (pDevice->Interrupt != NULL) {
-        WdfInterruptDisable(pDevice->Interrupt);
-    }
-
     status = GoodixReadVersion(pDevice, &version);
     if (NT_SUCCESS(status)) {
         pDevice->SensorId = version.SensorId;
@@ -1460,21 +1455,6 @@ OnD0Entry(
     if (!NT_SUCCESS(status)) {
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "GoodixReadIcInfo failed status=0x%08X, keeping defaults", status);
         status = STATUS_SUCCESS;
-    }
-
-    status = GoodixApplyReportRate(pDevice, pDevice->ReportRateLevel);
-    if (!NT_SUCCESS(status)) {
-        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "GoodixApplyReportRate failed level=%u status=0x%08X",
-            pDevice->ReportRateLevel, status);
-        status = STATUS_SUCCESS;
-    }
-
-    if (pDevice->Interrupt != NULL) {
-        WdfInterruptEnable(pDevice->Interrupt);
-    }
-
-    if (!pDevice->ConfigApplied) {
-        GoodixPollPendingControllerEvent(pDevice, 20, 20);
     }
 
     return status;
@@ -1524,52 +1504,6 @@ GoodixHandleControllerRequest(
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
             "Goodix request: unsupported code=0x%02X", RequestCode);
         break;
-    }
-}
-
-static
-VOID
-GoodixPollPendingControllerEvent(
-    _In_ PDEVICE_CONTEXT DeviceContext,
-    _In_ ULONG RetryCount,
-    _In_ ULONG DelayMs
-    )
-{
-    ULONG retry;
-    UINT8 infoBuf[3] = { 0 };
-    UINT8 touchEvtClear = 0;
-    NTSTATUS status;
-
-    for (retry = 0; retry < RetryCount; retry++) {
-        status = GoodixRead(DeviceContext, DeviceContext->TouchDataAddress, infoBuf, sizeof(infoBuf));
-        if (!NT_SUCCESS(status)) {
-            return;
-        }
-
-        if ((infoBuf[0] & GOODIX_REQUEST_EVENT) != 0) {
-            TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
-                "Goodix pending request event status=0x%02X code=0x%02X",
-                infoBuf[0], infoBuf[2]);
-            GoodixHandleControllerRequest(DeviceContext, infoBuf[2]);
-            GoodixWrite(DeviceContext, DeviceContext->TouchDataAddress, &touchEvtClear, 1);
-            return;
-        }
-
-        if (infoBuf[0] == EVT_ID_CONTROLLER_READY) {
-            TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
-                "Goodix pending controller ready event");
-            GoodixHandleControllerRequest(DeviceContext, 0x01);
-            GoodixWrite(DeviceContext, DeviceContext->TouchDataAddress, &touchEvtClear, 1);
-            return;
-        }
-
-        if ((infoBuf[0] & GOODIX_TOUCH_EVENT) != 0 || infoBuf[0] != 0x00) {
-            return;
-        }
-
-        if (DelayMs != 0) {
-            GoodixDelayMilliseconds((LONG)DelayMs);
-        }
     }
 }
 
