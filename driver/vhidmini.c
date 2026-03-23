@@ -107,6 +107,7 @@ static NTSTATUS GoodixCreateControlDevice(_In_ WDFDRIVER Driver);
 static VOID GoodixSetActiveTouchDevice(_In_ WDFDRIVER Driver, _In_opt_ WDFDEVICE Device);
 static PDEVICE_CONTEXT GoodixAcquireActiveDeviceContext(_In_ WDFDRIVER Driver, _Out_opt_ WDFDEVICE* ReferencedDevice);
 static VOID GoodixReleaseActiveDevice(_In_opt_ WDFDEVICE Device);
+static NTSTATUS GoodixReinitializeAfterReportRateChange(_In_ PDEVICE_CONTEXT DeviceContext);
 
 typedef struct _GOODIX_CFG_PACKAGE_INFO {
     const UINT8* ConfigData;
@@ -1761,6 +1762,108 @@ GoodixHandleControllerRequest(
 }
 
 NTSTATUS
+GoodixReinitializeAfterReportRateChange(
+    _In_ PDEVICE_CONTEXT DeviceContext
+    )
+{
+    NTSTATUS status;
+    GOODIX_FW_VERSION version = { 0 };
+    BOOLEAN interruptToggled = FALSE;
+
+    TraceEvents(
+        TRACE_LEVEL_INFORMATION,
+        TRACE_DEVICE,
+        "Goodix runtime reinit begin requestedLevel=%u",
+        DeviceContext->ReportRateLevel);
+
+    if (DeviceContext->Interrupt != NULL) {
+        WdfInterruptDisable(DeviceContext->Interrupt);
+        interruptToggled = TRUE;
+    }
+
+    status = GoodixResetDevice(DeviceContext, 30);
+    if (!NT_SUCCESS(status)) {
+        TraceEvents(
+            TRACE_LEVEL_WARNING,
+            TRACE_DEVICE,
+            "Goodix runtime reinit reset failed status=0x%08X",
+            status);
+        goto Exit;
+    }
+
+    DeviceContext->VersionValid = FALSE;
+    DeviceContext->IcInfoValid = FALSE;
+    DeviceContext->ConfigApplied = FALSE;
+    DeviceContext->ActiveReportRateLevel = 0xFF;
+
+    status = GoodixReadVersion(DeviceContext, &version);
+    if (NT_SUCCESS(status)) {
+        DeviceContext->SensorId = version.SensorId;
+        DeviceContext->VersionValid = TRUE;
+        TraceEvents(
+            TRACE_LEVEL_INFORMATION,
+            TRACE_DEVICE,
+            "Goodix runtime reinit version sensor_id=%u pid=%c%c%c%c%c%c%c%c",
+            version.SensorId,
+            version.PatchPid[0], version.PatchPid[1], version.PatchPid[2], version.PatchPid[3],
+            version.PatchPid[4], version.PatchPid[5], version.PatchPid[6], version.PatchPid[7]);
+    } else {
+        TraceEvents(
+            TRACE_LEVEL_WARNING,
+            TRACE_DEVICE,
+            "Goodix runtime reinit read version failed status=0x%08X",
+            status);
+        goto Exit;
+    }
+
+    status = GoodixReadIcInfo(DeviceContext);
+    if (!NT_SUCCESS(status)) {
+        TraceEvents(
+            TRACE_LEVEL_WARNING,
+            TRACE_DEVICE,
+            "Goodix runtime reinit ic_info failed status=0x%08X",
+            status);
+        goto Exit;
+    }
+
+    status = GoodixApplyEmbeddedConfig(DeviceContext);
+    if (!NT_SUCCESS(status)) {
+        TraceEvents(
+            TRACE_LEVEL_WARNING,
+            TRACE_DEVICE,
+            "Goodix runtime reinit config failed sensor_id=%u status=0x%08X",
+            DeviceContext->SensorId,
+            status);
+        goto Exit;
+    }
+
+    status = GoodixApplyReportRate(DeviceContext, DeviceContext->ReportRateLevel);
+    if (!NT_SUCCESS(status)) {
+        TraceEvents(
+            TRACE_LEVEL_WARNING,
+            TRACE_DEVICE,
+            "Goodix runtime reinit report rate failed level=%u status=0x%08X",
+            DeviceContext->ReportRateLevel,
+            status);
+        goto Exit;
+    }
+
+    TraceEvents(
+        TRACE_LEVEL_INFORMATION,
+        TRACE_DEVICE,
+        "Goodix runtime reinit complete level=%u active=%u",
+        DeviceContext->ReportRateLevel,
+        DeviceContext->ActiveReportRateLevel);
+
+Exit:
+    if (interruptToggled) {
+        WdfInterruptEnable(DeviceContext->Interrupt);
+    }
+
+    return status;
+}
+
+NTSTATUS
 GoodixProcessControlRequest(
     _In_ PDEVICE_CONTEXT DeviceContext,
     _In_ WDFREQUEST Request,
@@ -1809,6 +1912,7 @@ GoodixProcessControlRequest(
         PGOODIX_REPORT_RATE_CONTROL reportRateControl = NULL;
         size_t bufferLength = 0;
         UINT8 requestedLevel;
+        UINT8 previousPersistentLevel;
 
         status = WdfRequestRetrieveInputBuffer(
             Request,
@@ -1832,28 +1936,31 @@ GoodixProcessControlRequest(
                 ? 0xFF
                 : DeviceContext->ActiveReportRateLevel);
 
+        previousPersistentLevel = DeviceContext->ReportRateLevel;
         DeviceContext->ReportRateLevel = requestedLevel;
-        status = GoodixApplyReportRate(DeviceContext, requestedLevel);
+        status = GoodixPersistReportRateLevel(DeviceContext, requestedLevel);
         if (!NT_SUCCESS(status)) {
             TraceEvents(
                 TRACE_LEVEL_WARNING,
                 TRACE_DEVICE,
-                "Goodix control set report rate failed level=%u status=0x%08X",
+                "Goodix control set report rate persist failed level=%u status=0x%08X",
                 requestedLevel,
                 status);
+            DeviceContext->ReportRateLevel = previousPersistentLevel;
             return status;
         }
 
-        {
-            NTSTATUS persistStatus = GoodixPersistReportRateLevel(DeviceContext, requestedLevel);
-            if (!NT_SUCCESS(persistStatus)) {
-                TraceEvents(
-                    TRACE_LEVEL_WARNING,
-                    TRACE_DEVICE,
-                    "GoodixPersistReportRateLevel failed level=%u status=0x%08X",
-                    requestedLevel,
-                    persistStatus);
-            }
+        status = GoodixReinitializeAfterReportRateChange(DeviceContext);
+        if (!NT_SUCCESS(status)) {
+            DeviceContext->ReportRateLevel = previousPersistentLevel;
+            (void)GoodixPersistReportRateLevel(DeviceContext, previousPersistentLevel);
+            TraceEvents(
+                TRACE_LEVEL_WARNING,
+                TRACE_DEVICE,
+                "Goodix control set report rate reinit failed level=%u status=0x%08X",
+                requestedLevel,
+                status);
+            return status;
         }
 
         TraceEvents(
@@ -2536,26 +2643,34 @@ Return Value:
         break;
 
     case HIDMINI_CONTROL_CODE_SET_REPORT_RATE:
-        QueueContext->DeviceContext->ReportRateLevel =
-            GoodixNormalizeReportRateLevel((UINT8)controlInfo->u.ReportRate.Level);
-        status = GoodixApplyReportRate(
+    {
+        UINT8 requestedLevel;
+        UINT8 previousPersistentLevel;
+
+        requestedLevel = GoodixNormalizeReportRateLevel((UINT8)controlInfo->u.ReportRate.Level);
+        previousPersistentLevel = QueueContext->DeviceContext->ReportRateLevel;
+        QueueContext->DeviceContext->ReportRateLevel = requestedLevel;
+
+        status = GoodixPersistReportRateLevel(
             QueueContext->DeviceContext,
-            QueueContext->DeviceContext->ReportRateLevel);
-        if (NT_SUCCESS(status)) {
-            NTSTATUS persistStatus = GoodixPersistReportRateLevel(
-                QueueContext->DeviceContext,
-                QueueContext->DeviceContext->ReportRateLevel);
-            if (!NT_SUCCESS(persistStatus)) {
-                TraceEvents(
-                    TRACE_LEVEL_WARNING,
-                    TRACE_DEVICE,
-                    "GoodixPersistReportRateLevel failed level=%u status=0x%08X",
-                    QueueContext->DeviceContext->ReportRateLevel,
-                    persistStatus);
-            }
-            WdfRequestSetInformation(Request, reportSize);
+            requestedLevel);
+        if (!NT_SUCCESS(status)) {
+            QueueContext->DeviceContext->ReportRateLevel = previousPersistentLevel;
+            break;
         }
+
+        status = GoodixReinitializeAfterReportRateChange(QueueContext->DeviceContext);
+        if (!NT_SUCCESS(status)) {
+            QueueContext->DeviceContext->ReportRateLevel = previousPersistentLevel;
+            (void)GoodixPersistReportRateLevel(
+                QueueContext->DeviceContext,
+                previousPersistentLevel);
+            break;
+        }
+
+        WdfRequestSetInformation(Request, reportSize);
         break;
+    }
 
     default:
         status = STATUS_NOT_IMPLEMENTED;
