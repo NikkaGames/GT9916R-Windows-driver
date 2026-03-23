@@ -173,6 +173,7 @@ typedef struct _DEVICE_CONTEXT
     BOOLEAN                 OnClose;
     BOOLEAN                 ResetGpioPresent;
     UINT8                   LastTouchID;
+    UINT8                   LastLoggedTouchCount;
     UINT8                   ReportRateLevel;
     UINT8                   ActiveReportRateLevel;
     UINT8                   SensorId;

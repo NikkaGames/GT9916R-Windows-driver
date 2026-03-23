@@ -261,6 +261,37 @@ GoodixNormalizeReportRateLevel(
 
 static
 NTSTATUS
+GoodixPersistReportRateLevel(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _In_ UINT8 ReportRateLevel
+    )
+{
+    WDFKEY hKey = NULL;
+    UNICODE_STRING reportRateName;
+    NTSTATUS status;
+
+    status = WdfDeviceOpenRegistryKey(
+        DeviceContext->Device,
+        PLUGPLAY_REGKEY_DEVICE,
+        KEY_SET_VALUE,
+        WDF_NO_OBJECT_ATTRIBUTES,
+        &hKey);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    RtlInitUnicodeString(&reportRateName, L"ReportRateLevel");
+    status = WdfRegistryAssignULong(
+        hKey,
+        &reportRateName,
+        (ULONG)GoodixNormalizeReportRateLevel(ReportRateLevel));
+
+    WdfRegistryClose(hKey);
+    return status;
+}
+
+static
+NTSTATUS
 GoodixWriteLarge(
     _In_ PDEVICE_CONTEXT DeviceContext,
     _In_ UINT32 Address,
@@ -1059,6 +1090,8 @@ Return Value:
     deviceContext->OnClose = FALSE;
     deviceContext->ResetGpioId.QuadPart = 0;
     deviceContext->ResetGpioPresent = FALSE;
+    deviceContext->LastTouchID = 0;
+    deviceContext->LastLoggedTouchCount = 0xFF;
     deviceContext->ReportRateLevel = GOODIX_REPORT_RATE_240HZ;
     deviceContext->ActiveReportRateLevel = 0xFF;
     deviceContext->SensorId = 0;
@@ -2194,6 +2227,17 @@ Return Value:
             QueueContext->DeviceContext,
             QueueContext->DeviceContext->ReportRateLevel);
         if (NT_SUCCESS(status)) {
+            NTSTATUS persistStatus = GoodixPersistReportRateLevel(
+                QueueContext->DeviceContext,
+                QueueContext->DeviceContext->ReportRateLevel);
+            if (!NT_SUCCESS(persistStatus)) {
+                TraceEvents(
+                    TRACE_LEVEL_WARNING,
+                    TRACE_DEVICE,
+                    "GoodixPersistReportRateLevel failed level=%u status=0x%08X",
+                    QueueContext->DeviceContext->ReportRateLevel,
+                    persistStatus);
+            }
             WdfRequestSetInformation(Request, reportSize);
         }
         break;
@@ -2747,14 +2791,15 @@ OnInterruptIsr(
     readReport.DIG_TouchScreenContactCount = infoBuf[2];
 
     BYTE touch_count = infoBuf[2] & 0x0F;
+    UINT8 previousTouchCount = pDevice->LastLoggedTouchCount;
+    UINT8 firstTouchId = 0;
+    UINT16 firstTouchX = 0;
+    UINT16 firstTouchY = 0;
 
     if (touch_count > 10) // The touchscreen doesn't support more than 10 points.
     {
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "The touchscreen does not support more than 10 points. Defaulting to 10.");
         touch_count = 10;
-    }
-    else if (touch_count > 0) {
-        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "Touch Point(s): %d.", touch_count);
     }
 
     if (touch_count > 0) {
@@ -2775,7 +2820,14 @@ OnInterruptIsr(
             readReport.points[0] = 0x06;
             readReport.points[1] = pDevice->LastTouchID;
             readReport.DIG_TouchScreenContactCount = 1;
-            TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "Point Leave X:%d, Y:%d", x, y);
+            if (previousTouchCount != 0 && previousTouchCount != 0xFF) {
+                TraceEvents(
+                    TRACE_LEVEL_INFORMATION,
+                    TRACE_DEVICE,
+                    "Touch released id=%u",
+                    pDevice->LastTouchID);
+            }
+            pDevice->LastLoggedTouchCount = 0;
             break;
         }
         default: {
@@ -2784,15 +2836,30 @@ OnInterruptIsr(
                 touchId = ((touchBuf[0 + i * 8] >> 4) & 0x0F);
                 x = ((touchBuf[3 + i * 8] << 8) | touchBuf[2 + i * 8]) / 0x10;
                 y = ((touchBuf[5 + i * 8] << 8) | touchBuf[4 + i * 8]) / 0x10;
+                if (i == 0) {
+                    firstTouchId = touchId;
+                    firstTouchX = x;
+                    firstTouchY = y;
+                }
+                pDevice->LastTouchID = touchId;
                 readReport.points[i * 6 + 0] = 0x07;  // In Point
                 readReport.points[i * 6 + 1] = touchId;
                 readReport.points[i * 6 + 2] = x & 0xFF;
                 readReport.points[i * 6 + 3] = (x >> 8) & 0x0F;
                 readReport.points[i * 6 + 4] = y & 0xFF;
                 readReport.points[i * 6 + 5] = (y >> 8) & 0x0F;
-                TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "Touch %d X:%d, Y:%d", touchId + 1, x, y);
-                TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "Touch %d Buffer %x %x %x %x %x %x %x %x", touchId + 1, touchBuf[0 + i * 8], touchBuf[1 + i * 8], touchBuf[2 + i * 8], touchBuf[3 + i * 8], touchBuf[4 + i * 8], touchBuf[5 + i * 8], touchBuf[6 + i * 8], touchBuf[7 + i * 8]);
             }
+            if (previousTouchCount != touch_count) {
+                TraceEvents(
+                    TRACE_LEVEL_INFORMATION,
+                    TRACE_DEVICE,
+                    "Touch contacts=%u firstId=%u x=%u y=%u",
+                    touch_count,
+                    firstTouchId,
+                    firstTouchX,
+                    firstTouchY);
+            }
+            pDevice->LastLoggedTouchCount = touch_count;
         }
     }
 
