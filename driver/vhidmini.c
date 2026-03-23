@@ -101,6 +101,7 @@ static VOID GoodixCloseResetGpio(_In_ PDEVICE_CONTEXT DeviceContext);
 static NTSTATUS GoodixResetDevice(_In_ PDEVICE_CONTEXT DeviceContext, _In_ ULONG DelayMs);
 static NTSTATUS GoodixParseEmbeddedFirmware(_Out_ PGOODIX_PARSED_FW ParsedFirmware);
 static NTSTATUS GoodixMaybeUpdateFirmware(_In_ PDEVICE_CONTEXT DeviceContext, _Inout_ PGOODIX_FW_VERSION Version);
+static VOID GoodixHandleControllerRequest(_In_ PDEVICE_CONTEXT DeviceContext, _In_ UINT8 RequestCode);
 
 typedef struct _GOODIX_CFG_PACKAGE_INFO {
     const UINT8* ConfigData;
@@ -1460,13 +1461,6 @@ OnD0Entry(
         status = STATUS_SUCCESS;
     }
 
-    status = GoodixApplyEmbeddedConfig(pDevice);
-    if (!NT_SUCCESS(status)) {
-        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "GoodixApplyEmbeddedConfig failed sensor_id=%u status=0x%08X",
-            pDevice->SensorId, status);
-        status = STATUS_SUCCESS;
-    }
-
     status = GoodixApplyReportRate(pDevice, pDevice->ReportRateLevel);
     if (!NT_SUCCESS(status)) {
         TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "GoodixApplyReportRate failed level=%u status=0x%08X",
@@ -1479,6 +1473,53 @@ OnD0Entry(
     }
 
     return status;
+}
+
+static
+VOID
+GoodixHandleControllerRequest(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _In_ UINT8 RequestCode
+    )
+{
+    NTSTATUS status;
+
+    switch (RequestCode) {
+    case 0x01:
+        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
+            "Goodix request: config sensor_id=%u", DeviceContext->SensorId);
+        status = GoodixApplyEmbeddedConfig(DeviceContext);
+        if (!NT_SUCCESS(status)) {
+            TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE,
+                "GoodixApplyEmbeddedConfig failed from request sensor_id=%u status=0x%08X",
+                DeviceContext->SensorId, status);
+            return;
+        }
+
+        status = GoodixApplyReportRate(DeviceContext, DeviceContext->ReportRateLevel);
+        if (!NT_SUCCESS(status)) {
+            TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE,
+                "GoodixApplyReportRate after config failed level=%u status=0x%08X",
+                DeviceContext->ReportRateLevel, status);
+        }
+        break;
+
+    case 0x03:
+        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
+            "Goodix request: reset");
+        status = GoodixResetDevice(DeviceContext, 30);
+        if (!NT_SUCCESS(status)) {
+            TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE,
+                "GoodixResetDevice from request failed status=0x%08X",
+                status);
+        }
+        break;
+
+    default:
+        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
+            "Goodix request: unsupported code=0x%02X", RequestCode);
+        break;
+    }
 }
 
 NTSTATUS
@@ -2681,8 +2722,17 @@ OnInterruptIsr(
     case GOODIX_TOUCH_EVENT:
         break;
     case GOODIX_REQUEST_EVENT:
+        GoodixHandleControllerRequest(pDevice, infoBuf[2]);
+        goto exit;
     case GOODIX_GESTURE_EVENT:
     case GOODIX_HOTKNOT_EVENT:
+    case EVT_ID_CONTROLLER_READY:
+        if (!pDevice->ConfigApplied) {
+            TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
+                "Goodix controller ready, applying deferred config");
+            GoodixHandleControllerRequest(pDevice, 0x01);
+        }
+        goto exit;
     default:
         goto exit;
     }
