@@ -1457,6 +1457,30 @@ OnD0Entry(
         status = STATUS_SUCCESS;
     }
 
+    status = GoodixApplyEmbeddedConfig(pDevice);
+    if (!NT_SUCCESS(status)) {
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE,
+            "GoodixApplyEmbeddedConfig failed during init sensor_id=%u status=0x%08X",
+            pDevice->SensorId, status);
+        status = STATUS_SUCCESS;
+    } else if (pDevice->ConfigApplied) {
+        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
+            "Goodix embedded config applied during init sensor_id=%u",
+            pDevice->SensorId);
+    }
+
+    status = GoodixApplyReportRate(pDevice, pDevice->ReportRateLevel);
+    if (!NT_SUCCESS(status)) {
+        TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE,
+            "GoodixApplyReportRate failed during init level=%u status=0x%08X",
+            pDevice->ReportRateLevel, status);
+        status = STATUS_SUCCESS;
+    } else {
+        TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
+            "Goodix report rate applied during init level=%u",
+            pDevice->ReportRateLevel);
+    }
+
     return status;
 }
 
