@@ -1776,6 +1776,15 @@ GoodixProcessControlRequest(
         PGOODIX_TOUCH_REPORT_RATE_STATE rateState = NULL;
         size_t bufferLength = 0;
 
+        TraceEvents(
+            TRACE_LEVEL_INFORMATION,
+            TRACE_DEVICE,
+            "Goodix control get report rate requested persistent=%u active=%u",
+            DeviceContext->ReportRateLevel,
+            (DeviceContext->ActiveReportRateLevel == 0xFF)
+                ? DeviceContext->ReportRateLevel
+                : DeviceContext->ActiveReportRateLevel);
+
         status = WdfRequestRetrieveOutputBuffer(
             Request,
             sizeof(*rateState),
@@ -1813,9 +1822,25 @@ GoodixProcessControlRequest(
         requestedLevel = GoodixNormalizeReportRateLevel((UINT8)reportRateControl->Level);
         UNREFERENCED_PARAMETER(bufferLength);
 
+        TraceEvents(
+            TRACE_LEVEL_INFORMATION,
+            TRACE_DEVICE,
+            "Goodix control set report rate requested level=%u currentPersistent=%u currentActive=%u",
+            requestedLevel,
+            DeviceContext->ReportRateLevel,
+            (DeviceContext->ActiveReportRateLevel == 0xFF)
+                ? 0xFF
+                : DeviceContext->ActiveReportRateLevel);
+
         DeviceContext->ReportRateLevel = requestedLevel;
         status = GoodixApplyReportRate(DeviceContext, requestedLevel);
         if (!NT_SUCCESS(status)) {
+            TraceEvents(
+                TRACE_LEVEL_WARNING,
+                TRACE_DEVICE,
+                "Goodix control set report rate failed level=%u status=0x%08X",
+                requestedLevel,
+                status);
             return status;
         }
 
@@ -1830,6 +1855,13 @@ GoodixProcessControlRequest(
                     persistStatus);
             }
         }
+
+        TraceEvents(
+            TRACE_LEVEL_INFORMATION,
+            TRACE_DEVICE,
+            "Goodix control set report rate applied level=%u active=%u",
+            requestedLevel,
+            DeviceContext->ActiveReportRateLevel);
 
         WdfRequestSetInformation(Request, sizeof(*reportRateControl));
         return STATUS_SUCCESS;
@@ -4257,8 +4289,20 @@ GoodixApplyReportRate(
 
     if (pDevice->ActiveReportRateLevel == requestedLevel) {
         pDevice->ReportRateLevel = requestedLevel;
+        TraceEvents(
+            TRACE_LEVEL_INFORMATION,
+            TRACE_DEVICE,
+            "GoodixApplyReportRate skip level=%u already active",
+            requestedLevel);
         return STATUS_SUCCESS;
     }
+
+    TraceEvents(
+        TRACE_LEVEL_INFORMATION,
+        TRACE_DEVICE,
+        "GoodixApplyReportRate begin requested=%u currentActive=%u",
+        requestedLevel,
+        (pDevice->ActiveReportRateLevel == 0xFF) ? 0xFF : pDevice->ActiveReportRateLevel);
 
     switch (requestedLevel) {
     case GOODIX_REPORT_RATE_120HZ:
@@ -4369,6 +4413,18 @@ GoodixApplyReportRate(
     if (NT_SUCCESS(status)) {
         pDevice->ReportRateLevel = requestedLevel;
         pDevice->ActiveReportRateLevel = requestedLevel;
+        TraceEvents(
+            TRACE_LEVEL_INFORMATION,
+            TRACE_DEVICE,
+            "GoodixApplyReportRate success level=%u",
+            requestedLevel);
+    } else {
+        TraceEvents(
+            TRACE_LEVEL_WARNING,
+            TRACE_DEVICE,
+            "GoodixApplyReportRate failed level=%u status=0x%08X",
+            requestedLevel,
+            status);
     }
 
     return status;
