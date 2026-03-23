@@ -1072,6 +1072,23 @@ Return Value:
     //
     WdfFdoInitSetFilter(DeviceInit);
 
+    {
+        UNICODE_STRING deviceName;
+        UNICODE_STRING sddl;
+
+        RtlInitUnicodeString(&deviceName, GOODIX_TOUCH_CONTROL_NT_DEVICE_NAME);
+        status = WdfDeviceInitAssignName(DeviceInit, &deviceName);
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+
+        RtlInitUnicodeString(&sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;BU)");
+        status = WdfDeviceInitAssignSDDLString(DeviceInit, &sddl);
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+    }
+
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnpCallbacks);
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(
@@ -1091,6 +1108,16 @@ Return Value:
         NULL);
     if (!NT_SUCCESS(status)) {
         return status;
+    }
+
+    {
+        UNICODE_STRING symbolicLinkName;
+
+        RtlInitUnicodeString(&symbolicLinkName, GOODIX_TOUCH_CONTROL_DOS_DEVICE_NAME);
+        status = WdfDeviceCreateSymbolicLink(device, &symbolicLinkName);
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
     }
 
     deviceContext = GetDeviceContext(device);

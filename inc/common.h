@@ -47,6 +47,10 @@ DEFINE_GUID(
     0x4e06,
     0x98, 0x55, 0xcb, 0x07, 0xd9, 0x26, 0x1c, 0x84);
 
+#define GOODIX_TOUCH_CONTROL_NT_DEVICE_NAME   L"\\Device\\Goodix9916rTouchControl"
+#define GOODIX_TOUCH_CONTROL_DOS_DEVICE_NAME  L"\\DosDevices\\Goodix9916rTouchControl"
+#define GOODIX_TOUCH_CONTROL_WIN32_PATH       L"\\\\.\\Goodix9916rTouchControl"
+
 #define IOCTL_GOODIX_TOUCH_GET_REPORT_RATE \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
