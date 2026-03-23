@@ -20,6 +20,8 @@ Environment:
 #ifndef __VHIDMINI_COMMON_H__
 #define __VHIDMINI_COMMON_H__
 
+#include <guiddef.h>
+
 //
 // Custom control codes are defined here. They are to be used for sideband 
 // communication with the hid minidriver. These control codes are sent to 
@@ -36,6 +38,20 @@ Environment:
 //
 #define CONTROL_COLLECTION_REPORT_ID                      0x54
 #define TEST_COLLECTION_REPORT_ID                         0x02
+
+// {664F8A7F-30F5-4E06-9855-CB07D9261C84}
+DEFINE_GUID(
+    GUID_DEVINTERFACE_GOODIX_TOUCH_CONTROL,
+    0x664f8a7f,
+    0x30f5,
+    0x4e06,
+    0x98, 0x55, 0xcb, 0x07, 0xd9, 0x26, 0x1c, 0x84);
+
+#define IOCTL_GOODIX_TOUCH_GET_REPORT_RATE \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define IOCTL_GOODIX_TOUCH_SET_REPORT_RATE \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define MAXIMUM_STRING_LENGTH           (126 * sizeof(WCHAR))
 #define VHIDMINI_MANUFACTURER_STRING    L"UMDF Virtual hidmini device Manufacturer string"  
@@ -60,6 +76,13 @@ typedef struct _GOODIX_REPORT_RATE_CONTROL {
     ULONG Reserved;
 
 } GOODIX_REPORT_RATE_CONTROL, *PGOODIX_REPORT_RATE_CONTROL;
+
+typedef struct _GOODIX_TOUCH_REPORT_RATE_STATE {
+
+    ULONG PersistentLevel;
+    ULONG ActiveLevel;
+
+} GOODIX_TOUCH_REPORT_RATE_STATE, *PGOODIX_TOUCH_REPORT_RATE_STATE;
 
 typedef struct _HIDMINI_CONTROL_INFO {
 

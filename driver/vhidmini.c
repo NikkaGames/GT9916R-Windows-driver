@@ -15,6 +15,7 @@ Environment:
     Windows Driver Framework (WDF)
 
 --*/
+#include <initguid.h>
 #include "vhidmini.h"
 #include "goodix_9916r_blobs.h"
 #include "goodix_9916r_firmware.h"
@@ -1084,6 +1085,14 @@ Return Value:
         return status;
     }
 
+    status = WdfDeviceCreateDeviceInterface(
+        device,
+        &GUID_DEVINTERFACE_GOODIX_TOUCH_CONTROL,
+        NULL);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
     deviceContext = GetDeviceContext(device);
     deviceContext->Device       = device;
     deviceContext->DeviceData = 0;
@@ -1642,6 +1651,7 @@ Return Value:
 
 #ifdef _KERNEL_MODE
     queueConfig.EvtIoInternalDeviceControl  = EvtIoDeviceControl;
+    queueConfig.EvtIoDeviceControl          = EvtIoDeviceControl;
 #else
     //
     // HIDclass uses INTERNAL_IOCTL which is not supported by UMDF. Therefore
@@ -1723,6 +1733,63 @@ Return Value:
 
     switch (IoControlCode)
     {
+    case IOCTL_GOODIX_TOUCH_GET_REPORT_RATE:
+    {
+        PGOODIX_TOUCH_REPORT_RATE_STATE rateState = NULL;
+        size_t bufferLength = 0;
+
+        status = WdfRequestRetrieveOutputBuffer(
+            Request,
+            sizeof(*rateState),
+            (PVOID*)&rateState,
+            &bufferLength);
+        if (NT_SUCCESS(status)) {
+            UNREFERENCED_PARAMETER(bufferLength);
+            rateState->PersistentLevel = queueContext->DeviceContext->ReportRateLevel;
+            rateState->ActiveLevel =
+                (queueContext->DeviceContext->ActiveReportRateLevel == 0xFF)
+                ? queueContext->DeviceContext->ReportRateLevel
+                : queueContext->DeviceContext->ActiveReportRateLevel;
+            WdfRequestSetInformation(Request, sizeof(*rateState));
+        }
+        break;
+    }
+
+    case IOCTL_GOODIX_TOUCH_SET_REPORT_RATE:
+    {
+        PGOODIX_REPORT_RATE_CONTROL reportRateControl = NULL;
+        size_t bufferLength = 0;
+
+        status = WdfRequestRetrieveInputBuffer(
+            Request,
+            sizeof(*reportRateControl),
+            (PVOID*)&reportRateControl,
+            &bufferLength);
+        if (NT_SUCCESS(status)) {
+            UINT8 requestedLevel =
+                GoodixNormalizeReportRateLevel((UINT8)reportRateControl->Level);
+
+            UNREFERENCED_PARAMETER(bufferLength);
+            queueContext->DeviceContext->ReportRateLevel = requestedLevel;
+            status = GoodixApplyReportRate(queueContext->DeviceContext, requestedLevel);
+            if (NT_SUCCESS(status)) {
+                NTSTATUS persistStatus = GoodixPersistReportRateLevel(
+                    queueContext->DeviceContext,
+                    requestedLevel);
+                if (!NT_SUCCESS(persistStatus)) {
+                    TraceEvents(
+                        TRACE_LEVEL_WARNING,
+                        TRACE_DEVICE,
+                        "GoodixPersistReportRateLevel failed level=%u status=0x%08X",
+                        requestedLevel,
+                        persistStatus);
+                }
+                WdfRequestSetInformation(Request, sizeof(*reportRateControl));
+            }
+        }
+        break;
+    }
+
     case IOCTL_HID_GET_DEVICE_DESCRIPTOR:   // METHOD_NEITHER
         //
         // Retrieves the device's HID descriptor.
