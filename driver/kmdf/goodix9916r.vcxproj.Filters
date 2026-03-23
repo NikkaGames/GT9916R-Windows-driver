@@ -27,7 +27,7 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <ResourceCompile Include="vhidmini.rc">
+    <ResourceCompile Include="goodix9916r.rc">
       <Filter>Resource Files</Filter>
     </ResourceCompile>
   </ItemGroup>

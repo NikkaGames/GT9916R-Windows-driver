@@ -1,0 +1,89 @@
+;/*++
+;
+;Copyright (c) Microsoft Corporation All rights Reserved
+;
+;Module Name:
+;
+;    goodix9916r.inf
+;
+;Abstract:
+;    INF file for installing Goodix GT9916R touchscreen lower filter (KMDF version)
+;
+;--*/
+[Version]
+Signature="$WINDOWS NT$"
+Class=HIDClass
+ClassGuid={745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Provider=%ProviderString%
+DriverVer=10/01/2002,6.0.5058.0
+CatalogFile=goodix9916r.cat
+PnpLockdown=1
+
+[DestinationDirs]
+DefaultDestDir=13
+
+[SourceDisksNames]
+1=%DiskDesc%,,,
+
+[SourceDisksFiles]
+goodix9916r.sys=1
+
+[Manufacturer]
+%ManufacturerString%=Nikka,NT$ARCH$.10.0...18362
+
+[Nikka.NT$ARCH$.10.0...18362]
+%DeviceDesc%=goodix9916r, ACPI\GTX09916
+
+[goodix9916r.NT]
+CopyFiles=KMDriverCopy
+Include=MsHidKmdf.inf
+Needs=MsHidKmdf.NT
+
+[goodix9916r.NT.HW]
+Include=MsHidKmdf.inf
+Needs=MsHidKmdf.NT.HW
+AddReg=goodix9916r_AddReg
+
+[goodix9916r.NT.Services]
+Include=MsHidKmdf.inf
+Needs=MsHidKmdf.NT.Services
+AddService=goodix9916r,0,goodix9916r_Service_Inst
+
+[goodix9916r.NT.Filters]
+AddFilter=goodix9916r,,goodix9916r_Filter_Install
+
+[goodix9916r_Filter_Install]
+FilterPosition=Lower
+
+[goodix9916r_AddReg]
+HKR,,"LowerFilters",0x00010008,"goodix9916r"
+HKR,,"XRevert",0x00010001,0
+HKR,,"YRevert",0x00010001,0
+HKR,,"XYExchange",0x00010001,0
+HKR,,"XMin",0x00010001,0
+HKR,,"XMax",0x00010001,1116
+HKR,,"YMin",0x00010001,0
+HKR,,"YMax",0x00010001,2480
+
+[goodix9916r_Service_Inst]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %13%\goodix9916r.sys
+
+[goodix9916r.NT.Wdf]
+KmdfService=goodix9916r, goodix9916r_wdfsect
+
+[goodix9916r_wdfsect]
+KmdfLibraryVersion=$KMDFVERSION$
+
+[KMDriverCopy]
+goodix9916r.sys
+
+[Strings]
+ProviderString     = "Nikka"
+ManufacturerString = "Nikka"
+DeviceDesc         = "Goodix GT9916R Touchscreen Controller Device"
+ServiceDesc        = "Goodix GT9916R Touchscreen Controller Service"
+DiskDesc           = "Goodix GT9916R Touchscreen Controller Installation Disk"

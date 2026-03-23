@@ -1,5 +1,5 @@
 //---------------------------------------------------------------------------
-// vhidmini.rc
+// goodix9916r.rc
 //
 // Copyright (c) Microsoft Corporation, All Rights Reserved
 //---------------------------------------------------------------------------
@@ -10,7 +10,7 @@
 
 #define VER_FILETYPE                VFT_DRV
 #define VER_FILESUBTYPE             VFT2_DRV_SYSTEM
-#define VER_FILEDESCRIPTION_STR     "HID minidriver (KMDF version)"
-#define VER_INTERNALNAME_STR        "vhidmini.sys"
+#define VER_FILEDESCRIPTION_STR     "Goodix GT9916R Touchscreen Controller Driver"
+#define VER_INTERNALNAME_STR        "goodix9916r.sys"
 
 #include "common.ver"
