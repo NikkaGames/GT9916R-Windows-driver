@@ -1781,7 +1781,7 @@ GoodixReinitializeAfterReportRateChange(
         interruptToggled = TRUE;
     }
 
-    status = GoodixResetDevice(DeviceContext, 30);
+    status = GoodixResetDevice(DeviceContext, 100);
     if (!NT_SUCCESS(status)) {
         TraceEvents(
             TRACE_LEVEL_WARNING,
@@ -1790,6 +1790,8 @@ GoodixReinitializeAfterReportRateChange(
             status);
         goto Exit;
     }
+
+    GoodixDelayMilliseconds(20);
 
     DeviceContext->VersionValid = FALSE;
     DeviceContext->IcInfoValid = FALSE;
@@ -4172,29 +4174,29 @@ GoodixReadIcInfo(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    for (retry = 0; retry < 3; retry++) {
+    for (retry = 0; retry < 20; retry++) {
         status = GoodixRead(pDevice, GOODIX_IC_INFO_ADDR, (UINT8*)&icInfoLength, sizeof(icInfoLength));
         if (!NT_SUCCESS(status)) {
-            GoodixDelayMilliseconds(5);
+            GoodixDelayMilliseconds(10);
             continue;
         }
 
         icInfoLength = GoodixReadU16Le((const UINT8*)&icInfoLength);
         if (icInfoLength < 2 || icInfoLength > GOODIX_IC_INFO_MAX_LEN) {
             status = STATUS_INFO_LENGTH_MISMATCH;
-            GoodixDelayMilliseconds(5);
+            GoodixDelayMilliseconds(10);
             continue;
         }
 
         status = GoodixRead(pDevice, GOODIX_IC_INFO_ADDR, icInfoBuf, icInfoLength);
         if (!NT_SUCCESS(status)) {
-            GoodixDelayMilliseconds(5);
+            GoodixDelayMilliseconds(10);
             continue;
         }
 
         if (!GoodixChecksumValidU8Le(icInfoBuf, icInfoLength)) {
             status = STATUS_CRC_ERROR;
-            GoodixDelayMilliseconds(5);
+            GoodixDelayMilliseconds(10);
             continue;
         }
 
