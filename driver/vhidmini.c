@@ -49,7 +49,8 @@ Environment:
 #define GOODIX_CFG_CMD_EXIT                0x06U
 #define GOODIX_CFG_CMD_STATUS_PASS         0x80U
 #define GOODIX_CFG_CMD_WAIT_RETRY          20U
-#define GOODIX_CFG_TRANSFER_CHUNK          240U
+#define GOODIX_CFG_TRANSFER_CHUNK          64U
+#define GOODIX_CFG_TRANSFER_DELAY_MS       1U
 
 #define GOODIX_FW_HEADER_SIZE              512U
 #define GOODIX_FW_SUBSYS_INFO_SIZE         10U
@@ -285,6 +286,10 @@ GoodixWriteLarge(
         }
 
         offset += chunk;
+
+        if (offset < Length) {
+            GoodixDelayMilliseconds(GOODIX_CFG_TRANSFER_DELAY_MS);
+        }
     }
 
     return STATUS_SUCCESS;
@@ -318,6 +323,10 @@ GoodixReadLarge(
         }
 
         offset += chunk;
+
+        if (offset < Length) {
+            GoodixDelayMilliseconds(GOODIX_CFG_TRANSFER_DELAY_MS);
+        }
     }
 
     return STATUS_SUCCESS;
@@ -3793,6 +3802,8 @@ GoodixApplyEmbeddedConfig(
     if (!NT_SUCCESS(status)) {
         goto SendExit;
     }
+
+    GoodixDelayMilliseconds(2);
 
     status = GoodixReadLarge(
         pDevice,
