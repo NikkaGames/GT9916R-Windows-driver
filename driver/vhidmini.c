@@ -3687,13 +3687,13 @@ GoodixReadIcInfo(
             UINT8 stylusFreqNum;
             GOODIX_IC_INFO_MISC misc = { 0 };
 
-            if (remaining < 15U + 10U + 5U) {
+            if (remaining < 16U + 10U + 5U) {
                 status = STATUS_INVALID_BUFFER_SIZE;
                 break;
             }
 
-            cur += 15U;
-            remaining -= 15U;
+            cur += 16U;
+            remaining -= 16U;
             cur += 10U;
             remaining -= 10U;
 
