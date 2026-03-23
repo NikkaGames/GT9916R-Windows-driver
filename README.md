@@ -10,7 +10,7 @@ products:
 
 # Description
 
-This driver is intended for Goodix GT9916R SPI touchscreens commonly found in RedMagic 8 Pro and RedMagic 8S Pro. It does not contain any firmware upgrading/loading functionality, nor does it support any additional features from OEM, gestures etc.
+This driver is intended for Goodix GT9916R SPI touchscreens in RedMagic 8 Pro and RedMagic 8S Pro. It does contain firmware upgrading/loading functionality, supports sampling rate switching.
 Credits to Nikroks and Aistop.
 Forked from https://github.com/Project-Aloha/gtx9886-driver.
 
