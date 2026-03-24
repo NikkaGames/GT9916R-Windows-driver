@@ -52,6 +52,7 @@ Environment:
 #define GOODIX_CFG_CMD_WAIT_RETRY          20U
 #define GOODIX_CFG_TRANSFER_CHUNK          64U
 #define GOODIX_CFG_TRANSFER_DELAY_MS       1U
+#define GOODIX_SPB_XFER_TIMEOUT_MS         200U
 
 #define GOODIX_FW_HEADER_SIZE              512U
 #define GOODIX_FW_SUBSYS_INFO_SIZE         10U
@@ -103,6 +104,7 @@ static NTSTATUS GoodixResetDevice(_In_ PDEVICE_CONTEXT DeviceContext, _In_ ULONG
 static NTSTATUS GoodixParseEmbeddedFirmware(_Out_ PGOODIX_PARSED_FW ParsedFirmware);
 static NTSTATUS GoodixMaybeUpdateFirmware(_In_ PDEVICE_CONTEXT DeviceContext, _Inout_ PGOODIX_FW_VERSION Version);
 static VOID GoodixHandleControllerRequest(_In_ PDEVICE_CONTEXT DeviceContext, _In_ UINT8 RequestCode);
+static VOID GoodixQueueControllerRequest(_In_ PDEVICE_CONTEXT DeviceContext, _In_ UINT8 RequestCode);
 static NTSTATUS GoodixCreateControlDevice(_In_ WDFDRIVER Driver);
 static VOID GoodixSetActiveTouchDevice(_In_ WDFDRIVER Driver, _In_opt_ WDFDEVICE Device);
 static PDEVICE_CONTEXT GoodixAcquireActiveDeviceContext(_In_ WDFDRIVER Driver, _Out_opt_ WDFDEVICE* ReferencedDevice);
@@ -134,6 +136,21 @@ GoodixDelayMilliseconds(
 
     interval.QuadPart = -(10 * 1000 * Milliseconds);
     KeDelayExecutionThread(KernelMode, FALSE, &interval);
+}
+
+static
+VOID
+GoodixInitRequestSendOptions(
+    _Out_ WDF_REQUEST_SEND_OPTIONS* RequestSendOptions,
+    _In_ ULONG TimeoutMs
+    )
+{
+    WDF_REQUEST_SEND_OPTIONS_INIT(
+        RequestSendOptions,
+        WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(
+        RequestSendOptions,
+        WDF_REL_TIMEOUT_IN_MS(TimeoutMs));
 }
 
 static
@@ -1297,10 +1314,39 @@ Return Value:
     deviceContext->FirmwareUpdated = FALSE;
     deviceContext->SpbController = WDF_NO_HANDLE;
     deviceContext->ResetGpioIoTarget = WDF_NO_HANDLE;
+    deviceContext->ControllerRequestLock = WDF_NO_HANDLE;
+    deviceContext->ControllerRequestWorkItem = WDF_NO_HANDLE;
+    deviceContext->ControllerRequestWorkItemQueued = 0;
+    deviceContext->PendingControllerRequestCode = 0;
 
     status = WdfWaitLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &deviceContext->IoLock);
     if (!NT_SUCCESS(status)) {
         return status;
+    }
+
+    status = WdfWaitLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &deviceContext->ControllerRequestLock);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    {
+        WDF_OBJECT_ATTRIBUTES workItemAttributes;
+        WDF_WORKITEM_CONFIG workItemConfig;
+
+        WDF_OBJECT_ATTRIBUTES_INIT(&workItemAttributes);
+        workItemAttributes.ParentObject = device;
+
+        WDF_WORKITEM_CONFIG_INIT(
+            &workItemConfig,
+            GoodixControllerRequestWorkItem);
+
+        status = WdfWorkItemCreate(
+            &workItemConfig,
+            &workItemAttributes,
+            &deviceContext->ControllerRequestWorkItem);
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
     }
 
     hidAttributes = &deviceContext->HidDeviceAttributes;
@@ -1758,6 +1804,91 @@ GoodixHandleControllerRequest(
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
             "Goodix request: unsupported code=0x%02X", RequestCode);
         break;
+    }
+}
+
+static
+VOID
+GoodixQueueControllerRequest(
+    _In_ PDEVICE_CONTEXT DeviceContext,
+    _In_ UINT8 RequestCode
+    )
+{
+    UINT8 requestToQueue = RequestCode;
+
+    if (requestToQueue == 0) {
+        return;
+    }
+
+    WdfWaitLockAcquire(DeviceContext->ControllerRequestLock, NULL);
+
+    if (DeviceContext->PendingControllerRequestCode == 0x01 || requestToQueue == 0x01) {
+        DeviceContext->PendingControllerRequestCode = 0x01;
+    } else if (DeviceContext->PendingControllerRequestCode == 0) {
+        DeviceContext->PendingControllerRequestCode = requestToQueue;
+    } else {
+        DeviceContext->PendingControllerRequestCode = requestToQueue;
+    }
+
+    WdfWaitLockRelease(DeviceContext->ControllerRequestLock);
+
+    if (InterlockedCompareExchange(&DeviceContext->ControllerRequestWorkItemQueued, 1, 0) == 0) {
+        WdfWorkItemEnqueue(DeviceContext->ControllerRequestWorkItem);
+    }
+}
+
+VOID
+GoodixControllerRequestWorkItem(
+    _In_ WDFWORKITEM WorkItem
+    )
+{
+    WDFDEVICE device;
+    PDEVICE_CONTEXT deviceContext;
+    UINT8 requestCode;
+    BOOLEAN interruptToggled = FALSE;
+
+    device = (WDFDEVICE)WdfWorkItemGetParentObject(WorkItem);
+    deviceContext = GetDeviceContext(device);
+
+    for (;;) {
+        requestCode = 0;
+
+        WdfWaitLockAcquire(deviceContext->ControllerRequestLock, NULL);
+        requestCode = deviceContext->PendingControllerRequestCode;
+        deviceContext->PendingControllerRequestCode = 0;
+        WdfWaitLockRelease(deviceContext->ControllerRequestLock);
+
+        if (requestCode == 0) {
+            break;
+        }
+
+        if (deviceContext->Interrupt != NULL && !interruptToggled) {
+            WdfInterruptDisable(deviceContext->Interrupt);
+            interruptToggled = TRUE;
+        }
+
+        TraceEvents(
+            TRACE_LEVEL_INFORMATION,
+            TRACE_DEVICE,
+            "Goodix deferred request handling code=0x%02X",
+            requestCode);
+
+        GoodixHandleControllerRequest(deviceContext, requestCode);
+    }
+
+    if (interruptToggled) {
+        WdfInterruptEnable(deviceContext->Interrupt);
+    }
+
+    InterlockedExchange(&deviceContext->ControllerRequestWorkItemQueued, 0);
+
+    WdfWaitLockAcquire(deviceContext->ControllerRequestLock, NULL);
+    requestCode = deviceContext->PendingControllerRequestCode;
+    WdfWaitLockRelease(deviceContext->ControllerRequestLock);
+
+    if (requestCode != 0 &&
+        InterlockedCompareExchange(&deviceContext->ControllerRequestWorkItemQueued, 1, 0) == 0) {
+        WdfWorkItemEnqueue(deviceContext->ControllerRequestWorkItem);
     }
 }
 
@@ -3205,13 +3336,13 @@ OnInterruptIsr(
     if ((infoBuf[0] & GOODIX_TOUCH_EVENT) != 0) {
         // Continue into touch processing below.
     } else if ((infoBuf[0] & GOODIX_REQUEST_EVENT) != 0) {
-        GoodixHandleControllerRequest(pDevice, infoBuf[2]);
+        GoodixQueueControllerRequest(pDevice, infoBuf[2]);
         goto exit;
     } else if (infoBuf[0] == EVT_ID_CONTROLLER_READY) {
         if (!pDevice->ConfigApplied) {
             TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE,
-                "Goodix controller ready, applying deferred config");
-            GoodixHandleControllerRequest(pDevice, 0x01);
+                "Goodix controller ready, queueing deferred config");
+            GoodixQueueControllerRequest(pDevice, 0x01);
         }
         goto exit;
     } else if ((infoBuf[0] & (GOODIX_GESTURE_EVENT | GOODIX_HOTKNOT_EVENT)) != 0) {
@@ -3469,6 +3600,7 @@ GoodixWriteResetGpio(
     UCHAR value = Level ? 1U : 0U;
     WDF_MEMORY_DESCRIPTOR inputDescriptor;
     WDF_MEMORY_DESCRIPTOR outputDescriptor;
+    WDF_REQUEST_SEND_OPTIONS requestSendOptions;
 
     if (DeviceContext->ResetGpioIoTarget == WDF_NO_HANDLE) {
         return STATUS_NOT_SUPPORTED;
@@ -3476,6 +3608,7 @@ GoodixWriteResetGpio(
 
     WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&inputDescriptor, &value, sizeof(value));
     WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&outputDescriptor, &value, sizeof(value));
+    GoodixInitRequestSendOptions(&requestSendOptions, GOODIX_SPB_XFER_TIMEOUT_MS);
 
     return WdfIoTargetSendIoctlSynchronously(
         DeviceContext->ResetGpioIoTarget,
@@ -3483,7 +3616,7 @@ GoodixWriteResetGpio(
         IOCTL_GPIO_WRITE_PINS,
         &inputDescriptor,
         &outputDescriptor,
-        NULL,
+        &requestSendOptions,
         NULL);
 }
 
@@ -4056,6 +4189,7 @@ SpbDeviceWrite(
 )
 {
     WDF_MEMORY_DESCRIPTOR  inMemoryDescriptor;
+    WDF_REQUEST_SEND_OPTIONS requestSendOptions;
     ULONG_PTR  bytesWritten = (ULONG_PTR)NULL;
     NTSTATUS status;
 
@@ -4063,13 +4197,14 @@ SpbDeviceWrite(
     WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&inMemoryDescriptor,
         pInputBuffer,
         (ULONG)inputBufferLength);
+    GoodixInitRequestSendOptions(&requestSendOptions, GOODIX_SPB_XFER_TIMEOUT_MS);
 
     status = WdfIoTargetSendWriteSynchronously(
         pDevice->SpbController,
         NULL,
         &inMemoryDescriptor,
         NULL,
-        NULL,
+        &requestSendOptions,
         &bytesWritten
     );
 
@@ -4090,6 +4225,7 @@ SpbDeviceWriteRead(
 )
 {
     WDF_MEMORY_DESCRIPTOR  memoryDescriptor;
+    WDF_REQUEST_SEND_OPTIONS requestSendOptions;
     NTSTATUS status;
 
     SPB_TRANSFER_LIST_AND_ENTRIES(2) seq;
@@ -4116,6 +4252,7 @@ SpbDeviceWriteRead(
         &seq,
         sizeof(seq)
     );
+    GoodixInitRequestSendOptions(&requestSendOptions, GOODIX_SPB_XFER_TIMEOUT_MS);
 
     status = WdfIoTargetSendIoctlSynchronously(
         pDevice->SpbController,
@@ -4123,7 +4260,7 @@ SpbDeviceWriteRead(
         IOCTL_SPB_FULL_DUPLEX,
         &memoryDescriptor,
         NULL,
-        NULL,
+        &requestSendOptions,
         NULL
     );
 

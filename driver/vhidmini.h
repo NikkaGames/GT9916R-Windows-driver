@@ -148,6 +148,7 @@ EVT_WDF_DRIVER_DEVICE_ADD           EvtDeviceAdd;
 EVT_WDF_TIMER                       EvtTimerFunc;
 EVT_WDF_OBJECT_CONTEXT_CLEANUP      EvtDriverCleanup;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL  GoodixControlEvtIoDeviceControl;
+EVT_WDF_WORKITEM                    GoodixControllerRequestWorkItem;
 
 EVT_WDF_DEVICE_PREPARE_HARDWARE      OnPrepareHardware;
 EVT_WDF_DEVICE_RELEASE_HARDWARE      OnReleaseHardware;
@@ -171,8 +172,12 @@ typedef struct _DEVICE_CONTEXT
     WDFIOTARGET             SpbController;
     WDFIOTARGET             ResetGpioIoTarget;
     WDFWAITLOCK             IoLock;
+    WDFWAITLOCK             ControllerRequestLock;
+    WDFWORKITEM             ControllerRequestWorkItem;
     BOOLEAN                 OnClose;
     BOOLEAN                 ResetGpioPresent;
+    volatile LONG           ControllerRequestWorkItemQueued;
+    UINT8                   PendingControllerRequestCode;
     UINT8                   LastTouchID;
     UINT8                   LastLoggedTouchCount;
     UINT8                   ReportRateLevel;
