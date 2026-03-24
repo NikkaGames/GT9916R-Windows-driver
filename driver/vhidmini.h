@@ -177,6 +177,7 @@ typedef struct _DEVICE_CONTEXT
     BOOLEAN                 OnClose;
     BOOLEAN                 ResetGpioPresent;
     volatile LONG           ControllerRequestWorkItemQueued;
+    ULONG                   ConsecutiveTransportFailures;
     UINT8                   PendingControllerRequestCode;
     UINT8                   LastTouchID;
     UINT8                   LastLoggedTouchCount;

@@ -33,6 +33,7 @@ Environment:
 #define GOODIX_REQUEST_EVENT 0x40
 #define GOODIX_GESTURE_EVENT    0x20
 #define GOODIX_HOTKNOT_EVENT    0x10
+#define GOODIX_DEFERRED_REQUEST_RECOVER 0xFF
 #define BYTES_PER_COORD 0x8
 #define BYTES_CHKSUM 0x2
 #define MAX_POINT_NUM 0xA
@@ -53,6 +54,7 @@ Environment:
 #define GOODIX_CFG_TRANSFER_CHUNK          64U
 #define GOODIX_CFG_TRANSFER_DELAY_MS       1U
 #define GOODIX_SPB_XFER_TIMEOUT_MS         200U
+#define GOODIX_TRANSPORT_FAILURE_THRESHOLD 3U
 
 #define GOODIX_FW_HEADER_SIZE              512U
 #define GOODIX_FW_SUBSYS_INFO_SIZE         10U
@@ -1317,6 +1319,7 @@ Return Value:
     deviceContext->ControllerRequestLock = WDF_NO_HANDLE;
     deviceContext->ControllerRequestWorkItem = WDF_NO_HANDLE;
     deviceContext->ControllerRequestWorkItemQueued = 0;
+    deviceContext->ConsecutiveTransportFailures = 0;
     deviceContext->PendingControllerRequestCode = 0;
 
     status = WdfWaitLockCreate(WDF_NO_OBJECT_ATTRIBUTES, &deviceContext->IoLock);
@@ -1822,7 +1825,10 @@ GoodixQueueControllerRequest(
 
     WdfWaitLockAcquire(DeviceContext->ControllerRequestLock, NULL);
 
-    if (DeviceContext->PendingControllerRequestCode == 0x01 || requestToQueue == 0x01) {
+    if (DeviceContext->PendingControllerRequestCode == GOODIX_DEFERRED_REQUEST_RECOVER
+        || requestToQueue == GOODIX_DEFERRED_REQUEST_RECOVER) {
+        DeviceContext->PendingControllerRequestCode = GOODIX_DEFERRED_REQUEST_RECOVER;
+    } else if (DeviceContext->PendingControllerRequestCode == 0x01 || requestToQueue == 0x01) {
         DeviceContext->PendingControllerRequestCode = 0x01;
     } else if (DeviceContext->PendingControllerRequestCode == 0) {
         DeviceContext->PendingControllerRequestCode = requestToQueue;
@@ -1862,7 +1868,9 @@ GoodixControllerRequestWorkItem(
             break;
         }
 
-        if (deviceContext->Interrupt != NULL && !interruptToggled) {
+        if ((requestCode != GOODIX_DEFERRED_REQUEST_RECOVER)
+            && (deviceContext->Interrupt != NULL)
+            && !interruptToggled) {
             WdfInterruptDisable(deviceContext->Interrupt);
             interruptToggled = TRUE;
         }
@@ -1873,7 +1881,32 @@ GoodixControllerRequestWorkItem(
             "Goodix deferred request handling code=0x%02X",
             requestCode);
 
-        GoodixHandleControllerRequest(deviceContext, requestCode);
+        if (requestCode == GOODIX_DEFERRED_REQUEST_RECOVER) {
+            NTSTATUS status;
+
+            TraceEvents(
+                TRACE_LEVEL_WARNING,
+                TRACE_DEVICE,
+                "Goodix deferred recovery begin failures=%lu",
+                deviceContext->ConsecutiveTransportFailures);
+
+            status = GoodixReinitializeAfterReportRateChange(deviceContext);
+            if (NT_SUCCESS(status)) {
+                deviceContext->ConsecutiveTransportFailures = 0;
+                TraceEvents(
+                    TRACE_LEVEL_INFORMATION,
+                    TRACE_DEVICE,
+                    "Goodix deferred recovery completed");
+            } else {
+                TraceEvents(
+                    TRACE_LEVEL_WARNING,
+                    TRACE_DEVICE,
+                    "Goodix deferred recovery failed status=0x%08X",
+                    status);
+            }
+        } else {
+            GoodixHandleControllerRequest(deviceContext, requestCode);
+        }
     }
 
     if (interruptToggled) {
@@ -3313,6 +3346,7 @@ OnInterruptIsr(
     UINT8 infoBuf[3] = { 0 };
     UINT8 touchBuf[10 + MAX_POINT_NUM * BYTES_PER_COORD] = { 0 };
     UINT8 touchEvtClear = 0;
+    BOOLEAN clearTouchEvent = FALSE;
 
     UINT8 touchId = 0;
     UINT16 x = 0, y = 0;
@@ -3329,8 +3363,21 @@ OnInterruptIsr(
 
     status = GoodixRead(pDevice, pDevice->TouchDataAddress, infoBuf, sizeof(infoBuf));
     if (!NT_SUCCESS(status)) {
+        pDevice->ConsecutiveTransportFailures += 1;
+        TraceEvents(
+            TRACE_LEVEL_WARNING,
+            TRACE_DEVICE,
+            "Goodix interrupt header read failed status=0x%08X failures=%lu",
+            status,
+            pDevice->ConsecutiveTransportFailures);
+        if (pDevice->ConsecutiveTransportFailures >= GOODIX_TRANSPORT_FAILURE_THRESHOLD) {
+            GoodixQueueControllerRequest(pDevice, GOODIX_DEFERRED_REQUEST_RECOVER);
+        }
         goto exit;
     }
+
+    pDevice->ConsecutiveTransportFailures = 0;
+    clearTouchEvent = TRUE;
 
     // touchBuf[0] EventID
     if ((infoBuf[0] & GOODIX_TOUCH_EVENT) != 0) {
@@ -3372,8 +3419,21 @@ OnInterruptIsr(
             touchBuf,
             10 + BYTES_PER_COORD * (touch_count - 1));
         if (!NT_SUCCESS(status)) {
+            pDevice->ConsecutiveTransportFailures += 1;
+            TraceEvents(
+                TRACE_LEVEL_WARNING,
+                TRACE_DEVICE,
+                "Goodix touch payload read failed status=0x%08X failures=%lu",
+                status,
+                pDevice->ConsecutiveTransportFailures);
+            if (pDevice->ConsecutiveTransportFailures >= GOODIX_TRANSPORT_FAILURE_THRESHOLD) {
+                GoodixQueueControllerRequest(pDevice, GOODIX_DEFERRED_REQUEST_RECOVER);
+            }
+            clearTouchEvent = FALSE;
             goto exit;
         }
+
+        pDevice->ConsecutiveTransportFailures = 0;
     }
 
     switch(touch_count)
@@ -3442,7 +3502,21 @@ OnInterruptIsr(
     }
 
 exit:
-    GoodixWrite(pDevice, pDevice->TouchDataAddress, &touchEvtClear, 1);
+    if (clearTouchEvent) {
+        status = GoodixWrite(pDevice, pDevice->TouchDataAddress, &touchEvtClear, 1);
+        if (!NT_SUCCESS(status)) {
+            pDevice->ConsecutiveTransportFailures += 1;
+            TraceEvents(
+                TRACE_LEVEL_WARNING,
+                TRACE_DEVICE,
+                "Goodix interrupt clear failed status=0x%08X failures=%lu",
+                status,
+                pDevice->ConsecutiveTransportFailures);
+            if (pDevice->ConsecutiveTransportFailures >= GOODIX_TRANSPORT_FAILURE_THRESHOLD) {
+                GoodixQueueControllerRequest(pDevice, GOODIX_DEFERRED_REQUEST_RECOVER);
+            }
+        }
+    }
     return fInterruptRecognized;
 }
 
